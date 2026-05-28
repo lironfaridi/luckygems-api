@@ -1431,10 +1431,12 @@ MASTERY_TREE = {
 # /iap/validate/* endpoints and the /shop/iap_catalog display endpoint.
 # product_id values must match the Store Console SKU identifiers exactly.
 GEM_BUNDLES: List[Dict[str, Any]] = [
-    {"product_id": "gems_100",       "gems":  100, "gold":    0, "usd":  0.99, "label": "Gem Pouch"},
-    {"product_id": "bundle_welcome", "gems":  250, "gold": 1000, "usd":  1.99, "label": "Royal Starter Kit", "badge": "WELCOME BUNDLE"},
-    {"product_id": "gems_700",       "gems":  700, "gold":    0, "usd":  4.99, "label": "Gem Chest"},
-    {"product_id": "gems_1500",      "gems": 1500, "gold":    0, "usd":  9.99, "label": "Royal Vault",       "badge": "BEST VALUE"},
+    {"product_id": "gems_50",        "gems":   50, "gold":    0, "usd":  0.99, "label": "Gem Pouch"},
+    {"product_id": "bundle_welcome", "gems":  120, "gold": 1000, "usd":  1.99, "label": "Royal Starter Kit",  "badge": "WELCOME BUNDLE"},
+    {"product_id": "gems_350",       "gems":  350, "gold":    0, "usd":  4.99, "label": "Gem Chest"},
+    {"product_id": "gems_1500",      "gems": 1500, "gold":    0, "usd":  9.99, "label": "Royal Vault"},
+    {"product_id": "gems_1800",      "gems": 1800, "gold":    0, "usd": 19.99, "label": "Royal Hoard",        "badge": "MOST POPULAR"},
+    {"product_id": "gems_6000",      "gems": 6000, "gold":    0, "usd": 49.99, "label": "Titan Reserve",      "badge": "BEST VALUE"},
 ]
 _GEM_BUNDLES_BY_ID: Dict[str, Dict[str, Any]] = {b["product_id"]: b for b in GEM_BUNDLES}
 
