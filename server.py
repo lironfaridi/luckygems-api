@@ -843,6 +843,20 @@ def init_db():
     if not column_exists(cursor, "players", "last_welcome_back_date"):
         cursor.execute("ALTER TABLE players ADD COLUMN last_welcome_back_date TEXT DEFAULT NULL")
 
+    # telemetry_logs must exist before any ALTER TABLE checks against it.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS telemetry_logs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id  TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            event_data TEXT NOT NULL DEFAULT '{}',
+            timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_player ON telemetry_logs (player_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_event  ON telemetry_logs (event_name)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_ts     ON telemetry_logs (timestamp)")
+
     if not column_exists(cursor, "telemetry_logs", "session_id"):
         cursor.execute("ALTER TABLE telemetry_logs ADD COLUMN session_id TEXT DEFAULT NULL")
 
@@ -899,11 +913,6 @@ def init_db():
         cursor.execute(
             "ALTER TABLE telemetry_logs ADD COLUMN country_code TEXT DEFAULT NULL"
         )
-
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_telemetry_ts "
-        "ON telemetry_logs (timestamp)"
-    )
 
     # --- P6-S3: daily free-gem cap tracking ---
     if not column_exists(cursor, "players", "daily_gems_earned"):
@@ -987,18 +996,6 @@ def init_db():
             assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS telemetry_logs (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id  TEXT NOT NULL,
-            event_name TEXT NOT NULL,
-            event_data TEXT NOT NULL DEFAULT '{}',
-            timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_player ON telemetry_logs (player_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_event  ON telemetry_logs (event_name)")
 
     # Structured event stream with allowlist validation.  Separate from the legacy
     # telemetry_logs table so BI queries can target a clean, typed schema.
