@@ -280,8 +280,8 @@ def get_stage(index: int) -> dict:
 # Single source of truth -- client reads these from /shop/state.
 TIER_UNLOCK_COSTS = {
     3:           300,  # The Hook
-    4:         2_500,  # The Wall
-    5:        10_000,
+    4:         7_000,  # The Wall
+    5:        15_000,
     6:        35_000,
     7:       100_000,
     8:       250_000,
