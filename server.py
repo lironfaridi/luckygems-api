@@ -5845,17 +5845,19 @@ def _credit_gem_bundle(player_id: str, product_id: str, cursor) -> Dict[str, Any
         (total_gems, gold, price_usd, player_id)
     )
 
-    # Sales log entry for the base purchase
+    # Sales log entry for the base purchase.
+    # item_level=0 for IAP bundles (column is INTEGER; product_id is stored in the sales log
+    # only for gem merges where a numeric tier makes sense).
     cursor.execute(
         "INSERT INTO sales_log (seller, item_level, profit_made) VALUES (?, ?, ?)",
-        (player_id, product_id, price_usd)
+        (player_id, 0, price_usd)
     )
 
     # Separate log entry for the bonus (audit trail)
     if first_purchase and bonus_gems > 0:
         cursor.execute(
             "INSERT INTO sales_log (seller, item_level, profit_made) VALUES (?, ?, ?)",
-            (player_id, "first_purchase_bonus", 0.0)
+            (player_id, 0, 0.0)
         )
 
     cursor.execute(
@@ -6218,6 +6220,40 @@ async def telemetry_batch(request: Request):
         conn.close()
     except Exception as e:
         print(f"[telemetry/batch] DB error: {e}")
+
+    return {"status": "ok"}
+
+
+@app.post("/telemetry/crash")
+async def telemetry_crash(request: Request):
+    """
+    Client-side crash / HTTP-error report.
+    Body: {"context": str, "error": str, "breadcrumbs": [...], "platform": str, "build": str}
+    Always returns 200 -- must never block the game.
+    """
+    player_id = extract_player_id(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ok"}
+
+    event_data = {
+        "context":     str(body.get("context",   ""))[:128],
+        "error":       str(body.get("error",     ""))[:512],
+        "breadcrumbs": body.get("breadcrumbs", []),
+        "platform":    str(body.get("platform",  ""))[:32],
+        "build":       str(body.get("build",     ""))[:32],
+    }
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO telemetry_logs (player_id, event_name, event_data) VALUES (?, ?, ?)",
+            (player_id, "client_crash", json.dumps(event_data, ensure_ascii=False)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as _e:
+        print(f"[telemetry/crash] DB error: {_e}")
 
     return {"status": "ok"}
 
