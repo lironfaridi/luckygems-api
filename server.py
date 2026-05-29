@@ -457,8 +457,29 @@ _AD_PENDING_TOKENS: Dict[str, Dict] = {}
 # Set JWT_SECRET as an environment variable before deploying.
 # The dev fallback is intentionally weak -- do NOT ship it.
 # ---------------------------------------------------------------------------
-_JWT_SECRET    = os.environ.get("JWT_SECRET", "hostile-merge-dev-secret-change-before-ship")
-_JWT_ALGORITHM = "HS256"
+_JWT_SECRET_DEFAULT = "hostile-merge-dev-secret-change-before-ship"
+_JWT_SECRET         = os.environ.get("JWT_SECRET", _JWT_SECRET_DEFAULT)
+_JWT_ALGORITHM      = "HS256"
+_JWT_USING_DEFAULT  = (_JWT_SECRET == _JWT_SECRET_DEFAULT)
+
+_ENV = os.environ.get("ENV", "dev").strip().lower()
+
+if _JWT_USING_DEFAULT:
+    if _ENV != "dev":
+        raise RuntimeError(
+            "\n\n"
+            "  CRITICAL: Insecure JWT_SECRET detected in production environment!\n"
+            "  Set the JWT_SECRET environment variable to a strong random secret\n"
+            "  before starting the server outside of dev mode.\n"
+            "  Example: export JWT_SECRET=$(python -c \"import secrets; print(secrets.token_hex(32))\")\n"
+        )
+    else:
+        print(
+            "\n"
+            "  [security] WARNING: Running with the default dev JWT secret.\n"
+            "  This is acceptable for local development ONLY.\n"
+            "  Set JWT_SECRET before deploying to any shared or production environment.\n"
+        )
 
 # ---------------------------------------------------------------------------
 # Minimum client version enforcement
@@ -1467,8 +1488,9 @@ IAP_CATALOG = {
 @app.get("/health")
 def health():
     checks = {
-        "db":    "sqlite" if not _USE_POSTGRES else "postgres",
-        "redis": "connected" if _REDIS is not None else "disabled",
+        "db":         "sqlite" if not _USE_POSTGRES else "postgres",
+        "redis":      "connected" if _REDIS is not None else "disabled",
+        "jwt_secret": "default_UNSAFE" if _JWT_USING_DEFAULT else "configured",
         "push":  "configured" if (
             os.environ.get("FIREBASE_CREDENTIALS_JSON") or
             os.environ.get("APNS_KEY_P8")
@@ -1485,6 +1507,18 @@ def health():
         "status":  "ok",
         "version": "phase-6",
         "checks":  checks,
+    }
+
+
+@app.get("/health_security")
+def health_security():
+    """
+    Returns the JWT secret status without exposing the secret value.
+    Safe to call from any monitoring tool or CI pipeline.
+    """
+    return {
+        "jwt_secret_status": "default_UNSAFE" if _JWT_USING_DEFAULT else "configured",
+        "env":               _ENV,
     }
 
 
@@ -4420,17 +4454,6 @@ async def game_over_offer(request: Request):
                 "ttl_seconds": 60,
                 "affordable":  gems >= gems_needed,
             }
-
-    # Streak offer: decent run but no milestone gap to offer
-    if offer is None and cashouts_run >= 2:
-        offer = {
-            "type":        "continue",
-            "title":       "Keep the Streak!",
-            "body":        "Continue this run from your last cashout.",
-            "cost_gems":   30,
-            "ttl_seconds": 45,
-            "affordable":  gems >= 30,
-        }
 
     return {"offer": offer}
 
