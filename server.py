@@ -163,31 +163,31 @@ if _USE_POSTGRES:
 
 
 class _PgCursor:
-    """Thin adapter that translates SQLite-dialect SQL to PostgreSQL at call time.
+    """Translates SQLite-dialect SQL to PostgreSQL using deterministic string
+    replacement -- no regex.
 
-    Handles: ? → %s placeholders, INSERT OR IGNORE → ON CONFLICT DO NOTHING,
-    INTEGER PRIMARY KEY AUTOINCREMENT → BIGSERIAL PRIMARY KEY,
-    DATETIME column type → TIMESTAMP.
+    Handles three patterns that appear in our DDL and DML:
+      ?  ->  %s
+          Parameter placeholder swap. Safe because ? never appears inside
+          string literals in our queries -- only as a param marker.
+      INTEGER PRIMARY KEY AUTOINCREMENT  ->  BIGSERIAL PRIMARY KEY
+          DDL only (CREATE TABLE in init_db). Never appears in DML.
+      DATETIME  ->  TIMESTAMP
+          DDL only (CREATE TABLE column types). Never appears in DML.
+
+    INSERT OR IGNORE / INSERT OR REPLACE are intentionally NOT handled here.
+    Every call site that uses those constructs must use a _SQL_*_SQ / _SQL_*_PG
+    dual-dialect constant so the correct SQL is selected at import time, with
+    no runtime translation needed.
     """
-    _RE_OR_IGNORE   = re.compile(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b',              re.IGNORECASE)
-    _RE_OR_REPLACE  = re.compile(r'\bINSERT\s+OR\s+REPLACE\s+INTO\b',             re.IGNORECASE)
-    _RE_PLACEHOLDER = re.compile(r'\?')
-    _RE_AUTOINCR    = re.compile(r'\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b',  re.IGNORECASE)
-    _RE_DATETIME    = re.compile(r'\bDATETIME\b',                                  re.IGNORECASE)
 
     def __init__(self, raw_cursor):
         self._cur = raw_cursor
 
     def _translate(self, sql: str) -> str:
-        is_or_ignore  = bool(self._RE_OR_IGNORE.search(sql))
-        is_or_replace = bool(self._RE_OR_REPLACE.search(sql))
-        sql = self._RE_OR_IGNORE.sub("INSERT INTO",          sql)
-        sql = self._RE_OR_REPLACE.sub("INSERT INTO",         sql)
-        sql = self._RE_PLACEHOLDER.sub("%s",                 sql)
-        sql = self._RE_AUTOINCR.sub("BIGSERIAL PRIMARY KEY", sql)
-        sql = self._RE_DATETIME.sub("TIMESTAMP",             sql)
-        if is_or_ignore or is_or_replace:
-            sql = sql.rstrip("; \t\n\r") + " ON CONFLICT DO NOTHING"
+        sql = sql.replace("?",                                 "%s")
+        sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+        sql = sql.replace("DATETIME",                          "TIMESTAMP")
         return sql
 
     def execute(self, sql: str, params=()):
@@ -548,19 +548,60 @@ async def _get_country_from_ip(ip: str) -> str:
 
 
 def _issue_ad_token(player_id: str, context: str) -> str:
-    """Generate a 40-hex one-time token scoped to player_id + context."""
+    """Generate a 40-hex one-time token scoped to player_id + context.
+
+    Persists the token in Redis (TTL 90 s) when available so the token
+    survives server restarts and is visible to all uvicorn workers.
+    Falls back to the in-process _AD_PENDING_TOKENS dict when Redis is down.
+    """
     raw   = f"{player_id}:{context}:{time.monotonic()}:{random.getrandbits(64)}"
     token = hashlib.sha256(raw.encode()).hexdigest()[:40]
-    _AD_PENDING_TOKENS[player_id] = {
+    entry = {
         "context":    context,
         "token":      token,
         "expires_at": time.monotonic() + 90.0,
     }
+    _redis_ok = False
+    if _REDIS is not None:
+        try:
+            _REDIS.setex(
+                f"ad_token:{player_id}",
+                90,
+                json.dumps({"context": context, "token": token}),
+            )
+            _redis_ok = True
+        except Exception:
+            pass  # Redis fault: fall through to in-process dict
+    if not _redis_ok:
+        _AD_PENDING_TOKENS[player_id] = entry
     return token
 
 
 def _consume_ad_token(player_id: str, expected_context: str, provided_token: str) -> bool:
-    """Validate and consume the token.  Returns True only on an exact, unexpired match."""
+    """Validate and consume the token.  Returns True only on an exact, unexpired match.
+
+    Reads from Redis first.  If the key is absent in Redis (miss, expired, or Redis
+    is down) falls back to the in-process _AD_PENDING_TOKENS dict so tokens issued
+    before a Redis outage are still honoured.
+    """
+    # --- Redis path ---
+    if _REDIS is not None:
+        try:
+            raw = _REDIS.get(f"ad_token:{player_id}")
+            if raw is not None:
+                stored = json.loads(raw)
+                if stored.get("context") != expected_context:
+                    return False
+                if stored.get("token") != provided_token:
+                    return False
+                _REDIS.delete(f"ad_token:{player_id}")  # one-time use
+                return True
+            # Key absent in Redis: fall through to in-process dict (handles
+            # tokens that were issued while Redis was unavailable).
+        except Exception:
+            pass  # Redis fault: fall through to in-process dict
+
+    # --- In-process fallback ---
     entry = _AD_PENDING_TOKENS.get(player_id)
     if not entry:
         return False
@@ -643,6 +684,20 @@ QUEST_POOL = [
     {"id": "q_earn_5000",   "title": "Fat Stack",      "desc": "Earn 5,000 cash in one run.",     "type": "cash_earned",     "target": 5000,"reward": 700,  "gems_reward": 2},
 ]
 _QUEST_MAP = {q["id"]: q for q in QUEST_POOL}
+
+# Gold reward multiplier per board stage.  Stages 6+ use the max bucket (25x).
+QUEST_STAGE_MULTIPLIERS: Dict[int, float] = {
+    0: 1.0,
+    1: 1.0,
+    2: 2.0,
+    3: 4.0,
+    4: 8.0,
+    5: 15.0,
+}
+_QUEST_STAGE_MAX_MULT: float = 25.0
+
+def _get_quest_multiplier(board_stage: int) -> float:
+    return QUEST_STAGE_MULTIPLIERS.get(board_stage, _QUEST_STAGE_MAX_MULT)
 
 # Day 1-7 login rewards.  free_spin=True resets last_free_spin_time so the
 # /wheel/spin free-daily gate opens immediately.
@@ -1092,6 +1147,11 @@ def init_db():
             "ALTER TABLE players ADD COLUMN first_iap_done INTEGER DEFAULT 0"
         )
 
+    if not column_exists(cursor, "players", "seen_day7_offer"):
+        cursor.execute(
+            "ALTER TABLE players ADD COLUMN seen_day7_offer INTEGER DEFAULT 0"
+        )
+
     # --- P6-S4: GDPR deletion audit log (never purged) ---
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS gdpr_deletion_log (
@@ -1136,10 +1196,7 @@ def init_db():
     )
 
     for lvl, cfg in MARKET_CONFIG.items():
-        cursor.execute("""
-            INSERT OR IGNORE INTO market_prices (item_level, current_price)
-            VALUES (?, ?)
-        """, (lvl, cfg["base"]))
+        cursor.execute(_SQL_INSERT_MARKET_PRICE, (lvl, cfg["base"]))
 
     conn.commit()
     conn.close()
@@ -1183,15 +1240,109 @@ async def _verify_financial_signature(request: Request, raw_token: str) -> None:
         raise HTTPException(status_code=403, detail="Invalid request signature")
 
 
+# ---------------------------------------------------------------------------
+# Dual-dialect SQL constants
+#
+# SQLite uses ? placeholders and INSERT OR IGNORE / INSERT OR REPLACE.
+# PostgreSQL uses %s and ON CONFLICT clauses with explicit conflict targets.
+# INSERT OR REPLACE semantics differ by table:
+#   - "ignore"  tables want ON CONFLICT DO NOTHING
+#   - "replace" tables want ON CONFLICT (...) DO UPDATE SET ...
+#
+# Naming: _SQL_<LABEL>_SQ = SQLite form   _SQL_<LABEL>_PG = PostgreSQL form
+#         _SQL_<LABEL>    = the one that is actually used at runtime
+# ---------------------------------------------------------------------------
+
+_SQL_UPSERT_PLAYER_SQ = """
+    INSERT OR IGNORE INTO players
+    (player_id, total_money, max_unlocked_tier, board_size, board_stage, tutorial_completed,
+     lifetime_cash_earned, best_survival_time, best_cashouts_run, best_combo,
+     cursed_tiles_removed, total_runs, total_merges, gems_balance, piggy_balance,
+     active_modifier, last_free_spin_time)
+    VALUES (?, 2000, 2, 3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 20, 0, NULL, NULL)
+"""
+_SQL_UPSERT_PLAYER_PG = """
+    INSERT INTO players
+    (player_id, total_money, max_unlocked_tier, board_size, board_stage, tutorial_completed,
+     lifetime_cash_earned, best_survival_time, best_cashouts_run, best_combo,
+     cursed_tiles_removed, total_runs, total_merges, gems_balance, piggy_balance,
+     active_modifier, last_free_spin_time)
+    VALUES (%s, 2000, 2, 3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 20, 0, NULL, NULL)
+    ON CONFLICT (player_id) DO NOTHING
+"""
+_SQL_UPSERT_PLAYER = _SQL_UPSERT_PLAYER_PG if _USE_POSTGRES else _SQL_UPSERT_PLAYER_SQ
+
+_SQL_INSERT_MARKET_PRICE_SQ = """
+    INSERT OR IGNORE INTO market_prices (item_level, current_price)
+    VALUES (?, ?)
+"""
+_SQL_INSERT_MARKET_PRICE_PG = """
+    INSERT INTO market_prices (item_level, current_price)
+    VALUES (%s, %s)
+    ON CONFLICT (item_level) DO NOTHING
+"""
+_SQL_INSERT_MARKET_PRICE = _SQL_INSERT_MARKET_PRICE_PG if _USE_POSTGRES else _SQL_INSERT_MARKET_PRICE_SQ
+
+# device_tokens: INSERT OR REPLACE -- must UPDATE the token when the row exists,
+# not silently skip it.  Conflict target mirrors the UNIQUE(player_id, platform) constraint.
+_SQL_UPSERT_DEVICE_TOKEN_SQ = (
+    "INSERT OR REPLACE INTO device_tokens "
+    "(player_id, token, platform) VALUES (?, ?, ?)"
+)
+_SQL_UPSERT_DEVICE_TOKEN_PG = (
+    "INSERT INTO device_tokens "
+    "(player_id, token, platform) VALUES (%s, %s, %s) "
+    "ON CONFLICT (player_id, platform) DO UPDATE SET token = EXCLUDED.token"
+)
+_SQL_UPSERT_DEVICE_TOKEN = _SQL_UPSERT_DEVICE_TOKEN_PG if _USE_POSTGRES else _SQL_UPSERT_DEVICE_TOKEN_SQ
+
+# ab_assignments: INSERT OR IGNORE -- once a variant is assigned, never overwrite it.
+_SQL_INSERT_AB_ASSIGNMENT_SQ = (
+    "INSERT OR IGNORE INTO ab_assignments "
+    "(player_id, flag_key, variant) VALUES (?, ?, ?)"
+)
+_SQL_INSERT_AB_ASSIGNMENT_PG = (
+    "INSERT INTO ab_assignments "
+    "(player_id, flag_key, variant) VALUES (%s, %s, %s) "
+    "ON CONFLICT (player_id, flag_key) DO NOTHING"
+)
+_SQL_INSERT_AB_ASSIGNMENT = _SQL_INSERT_AB_ASSIGNMENT_PG if _USE_POSTGRES else _SQL_INSERT_AB_ASSIGNMENT_SQ
+
+# achievements: INSERT OR IGNORE -- an already-unlocked achievement must not be re-awarded.
+_SQL_INSERT_ACHIEVEMENT_SQ = """
+    INSERT OR IGNORE INTO achievements (player_id, achievement_id)
+    VALUES (?, ?)
+"""
+_SQL_INSERT_ACHIEVEMENT_PG = """
+    INSERT INTO achievements (player_id, achievement_id)
+    VALUES (%s, %s)
+    ON CONFLICT (player_id, achievement_id) DO NOTHING
+"""
+_SQL_INSERT_ACHIEVEMENT = _SQL_INSERT_ACHIEVEMENT_PG if _USE_POSTGRES else _SQL_INSERT_ACHIEVEMENT_SQ
+
+# player_quests: INSERT OR REPLACE -- must overwrite all columns when re-assigning a quest.
+# Conflict target is the player_id PRIMARY KEY.
+_SQL_ASSIGN_QUEST_SQ = """
+    INSERT OR REPLACE INTO player_quests
+    (player_id, quest_id, progress, target, reward, assigned_at)
+    VALUES (?, ?, 0, ?, ?, CURRENT_TIMESTAMP)
+"""
+_SQL_ASSIGN_QUEST_PG = """
+    INSERT INTO player_quests
+    (player_id, quest_id, progress, target, reward, assigned_at)
+    VALUES (%s, %s, 0, %s, %s, CURRENT_TIMESTAMP)
+    ON CONFLICT (player_id) DO UPDATE SET
+        quest_id    = EXCLUDED.quest_id,
+        progress    = 0,
+        target      = EXCLUDED.target,
+        reward      = EXCLUDED.reward,
+        assigned_at = EXCLUDED.assigned_at
+"""
+_SQL_ASSIGN_QUEST = _SQL_ASSIGN_QUEST_PG if _USE_POSTGRES else _SQL_ASSIGN_QUEST_SQ
+
+
 def get_or_create_player(player_id: str, cursor) -> None:
-    cursor.execute("""
-        INSERT OR IGNORE INTO players
-        (player_id, total_money, max_unlocked_tier, board_size, board_stage, tutorial_completed,
-         lifetime_cash_earned, best_survival_time, best_cashouts_run, best_combo,
-         cursed_tiles_removed, total_runs, total_merges, gems_balance, piggy_balance,
-         active_modifier, last_free_spin_time)
-        VALUES (?, 2000, 2, 3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 20, 0, NULL, NULL)
-    """, (player_id,))
+    cursor.execute(_SQL_UPSERT_PLAYER, (player_id,))
 
 
 def calculate_adjusted_prices(board_data: List[int]):
@@ -1199,11 +1350,29 @@ def calculate_adjusted_prices(board_data: List[int]):
         return {}
     if len(board_data) > 64:
         raise HTTPException(status_code=400, detail="board_data exceeds maximum supported board size")
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT item_level, current_price FROM market_prices")
-    market_raw = dict(cursor.fetchall())
-    conn.close()
+
+    # Serve market price rows from Redis when available (5s TTL).
+    # JSON round-trip turns int keys to strings; restore them with int(k).
+    market_raw = None
+    if _REDIS is not None:
+        try:
+            _cached = _REDIS.get("market_prices_cache")
+            if _cached:
+                market_raw = {int(k): v for k, v in json.loads(_cached).items()}
+        except Exception:
+            pass  # Redis fault: fall through to DB
+
+    if market_raw is None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT item_level, current_price FROM market_prices")
+        market_raw = dict(cursor.fetchall())
+        conn.close()
+        if _REDIS is not None:
+            try:
+                _REDIS.setex("market_prices_cache", 5, json.dumps(market_raw))
+            except Exception:
+                pass  # Redis fault: prices served from DB, cache skipped
 
     counts = {lvl: board_data.count(lvl) for lvl in MARKET_CONFIG.keys()}
     adjusted_prices = {}
@@ -1273,6 +1442,12 @@ def update_global_market(item_level, impact_type="sale", is_player_sale: bool = 
 
     conn.commit()
     conn.close()
+
+    if _REDIS is not None:
+        try:
+            _REDIS.delete("market_prices_cache")
+        except Exception:
+            pass  # Redis fault: stale cache expires naturally within 5s TTL
 
 
 def calculate_tool_costs(board_data: List[int], elapsed_time: float = 0.0,
@@ -1608,11 +1783,7 @@ async def register_device_token(request: Request):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO device_tokens "
-            "(player_id, token, platform) VALUES (?, ?, ?)",
-            (player_id, token, platform)
-        )
+        cursor.execute(_SQL_UPSERT_DEVICE_TOKEN, (player_id, token, platform))
         conn.commit()
     finally:
         conn.close()
@@ -1762,11 +1933,7 @@ async def get_config_flags(request: Request):
                 new_assignments.append((player_id, key, chosen))
 
         for (pid, fk, var) in new_assignments:
-            cursor.execute(
-                "INSERT OR IGNORE INTO ab_assignments "
-                "(player_id, flag_key, variant) VALUES (?, ?, ?)",
-                (pid, fk, var)
-            )
+            cursor.execute(_SQL_INSERT_AB_ASSIGNMENT, (pid, fk, var))
             try:
                 cursor.execute(
                     "INSERT INTO telemetry_logs "
@@ -2026,6 +2193,78 @@ async def claim_daily_reward(request: Request):
     xp_info_d = _grant_xp(cursor, player_id, 25)
 
     cursor.execute(
+        "SELECT total_money, gems_balance, seen_day7_offer, first_iap_done FROM players WHERE player_id = ?",
+        (player_id,)
+    )
+    updated = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    _invalidate_balance_cache(player_id)
+
+    _seen_day7       = int(updated[2]) if updated[2] is not None else 0
+    _first_iap       = int(updated[3]) if updated[3] is not None else 0
+    show_day7_offer  = (new_streak == 7 and _seen_day7 == 0 and _first_iap == 0)
+
+    resp_d = {
+        "status":           "success",
+        "day":              new_streak,
+        "streak":           new_streak,
+        "gold_gained":      gold_grant,
+        "gems_gained":      actual_gems,
+        "gems_awarded":     actual_gems,
+        "gem_cap_hit":      actual_gems < gems_grant,
+        "free_spin":        free_spin,
+        "label":            reward["label"],
+        "new_balance":      int(updated[0]),
+        "new_gems":         int(updated[1]),
+        "show_day7_offer":  show_day7_offer,
+    }
+    resp_d.update(xp_info_d)
+    return resp_d
+
+
+@app.post("/player/mark_day7_offer_seen")
+def mark_day7_offer_seen(request: Request):
+    player_id = extract_player_id(request)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE players SET seen_day7_offer = 1 WHERE player_id = ?",
+        (player_id,)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+
+@app.post("/shop/vault_champion_bundle")
+def purchase_vault_champion_bundle(request: Request):
+    player_id = extract_player_id(request)
+    conn = get_connection()
+    cursor = conn.cursor()
+    get_or_create_player(player_id, cursor)
+
+    cursor.execute(
+        "SELECT seen_day7_offer, first_iap_done FROM players WHERE player_id = ?",
+        (player_id,)
+    )
+    row = cursor.fetchone()
+    seen_day7  = int(row[0]) if row and row[0] is not None else 0
+    first_iap  = int(row[1]) if row and row[1] is not None else 0
+
+    gems_granted = 350
+    gold_granted = 5_000
+
+    cursor.execute("""
+        UPDATE players
+        SET total_money    = total_money    + ?,
+            gems_balance   = gems_balance   + ?,
+            seen_day7_offer = 1,
+            first_iap_done  = 1
+        WHERE player_id = ?
+    """, (gold_granted, gems_granted, player_id))
+
+    cursor.execute(
         "SELECT total_money, gems_balance FROM players WHERE player_id = ?",
         (player_id,)
     )
@@ -2034,21 +2273,14 @@ async def claim_daily_reward(request: Request):
     conn.close()
     _invalidate_balance_cache(player_id)
 
-    resp_d = {
-        "status":      "success",
-        "day":         new_streak,
-        "streak":      new_streak,
-        "gold_gained": gold_grant,
-        "gems_gained": actual_gems,
-        "gems_awarded": actual_gems,
-        "gem_cap_hit":  actual_gems < gems_grant,
-        "free_spin":   free_spin,
-        "label":       reward["label"],
-        "new_balance": int(updated[0]),
-        "new_gems":    int(updated[1]),
+    return {
+        "status":       "success",
+        "gems_granted": gems_granted,
+        "gold_granted": gold_granted,
+        "new_balance":  int(updated[0]),
+        "new_gems":     int(updated[1]),
+        "already_owned": bool(seen_day7 or first_iap),
     }
-    resp_d.update(xp_info_d)
-    return resp_d
 
 
 @app.post("/player/open_piggy")
@@ -2949,10 +3181,7 @@ _ACH_STAT_SELECT_SQL: Dict[str, str] = {
 
 
 def unlock_achievement(cursor, player_id: str, achievement_id: str):
-    cursor.execute("""
-        INSERT OR IGNORE INTO achievements (player_id, achievement_id)
-        VALUES (?, ?)
-    """, (player_id, achievement_id))
+    cursor.execute(_SQL_INSERT_ACHIEVEMENT, (player_id, achievement_id))
 
 
 def check_and_unlock_achievements(cursor, player_id: str) -> List[Dict[str, Any]]:
@@ -3113,16 +3342,17 @@ def get_or_assign_quest(cursor, player_id: str) -> dict:
     }
 
 
-def evaluate_and_advance_quest(cursor, player_id: str, run_stats: Dict[str, Any]) -> dict:
+def evaluate_and_advance_quest(cursor, player_id: str, run_stats: Dict[str, Any], board_stage: int = 0) -> dict:
     quest = get_or_assign_quest(cursor, player_id)
     stat_value = int(run_stats.get(quest["type"], 0))
     new_progress = max(quest["progress"], stat_value)
 
     reward_granted      = 0
     gems_reward_granted = 0
+    _quest_mult = _get_quest_multiplier(board_stage)
     if new_progress >= quest["target"]:
-        reward_granted = quest["reward"]
-        # Gold grant
+        reward_granted = int(quest["reward"] * _quest_mult)
+        # Gold grant (scaled by board stage)
         cursor.execute("""
             UPDATE players SET total_money = total_money + ? WHERE player_id = ?
         """, (reward_granted, player_id))
@@ -3135,31 +3365,31 @@ def evaluate_and_advance_quest(cursor, player_id: str, run_stats: Dict[str, Any]
         # Assign a new quest (prefer a different one when pool is large enough).
         choices = [q for q in QUEST_POOL if q["id"] != quest["quest_id"]] or QUEST_POOL
         next_quest = random.choice(choices)
-        cursor.execute("""
-            INSERT OR REPLACE INTO player_quests (player_id, quest_id, progress, target, reward, assigned_at)
-            VALUES (?, ?, 0, ?, ?, CURRENT_TIMESTAMP)
-        """, (player_id, next_quest["id"], next_quest["target"], next_quest["reward"]))
+        cursor.execute(_SQL_ASSIGN_QUEST, (player_id, next_quest["id"], next_quest["target"], next_quest["reward"]))
         return {
-            "completed":          True,
-            "reward_granted":     reward_granted,
+            "completed":           True,
+            "reward_granted":      reward_granted,
+            "base_reward":         quest["reward"],
             "gems_reward_granted": gems_reward_granted,
             "old_quest": quest,
             "new_quest": {
-                "quest_id":   next_quest["id"],
-                "title":      next_quest["title"],
-                "desc":       next_quest["desc"],
-                "type":       next_quest["type"],
-                "progress":   0,
-                "target":     next_quest["target"],
-                "reward":     next_quest["reward"],
-                "gems_reward": int(next_quest.get("gems_reward", 0)),
+                "quest_id":      next_quest["id"],
+                "title":         next_quest["title"],
+                "desc":          next_quest["desc"],
+                "type":          next_quest["type"],
+                "progress":      0,
+                "target":        next_quest["target"],
+                "reward":        next_quest["reward"],
+                "scaled_reward": int(next_quest["reward"] * _quest_mult),
+                "gems_reward":   int(next_quest.get("gems_reward", 0)),
             },
         }
 
     cursor.execute("""
         UPDATE player_quests SET progress = ? WHERE player_id = ?
     """, (new_progress, player_id))
-    quest["progress"] = new_progress
+    quest["progress"]      = new_progress
+    quest["scaled_reward"] = int(quest["reward"] * _quest_mult)
     return {
         "completed":          False,
         "reward_granted":     0,
@@ -3175,8 +3405,13 @@ def get_quest_state(request: Request):
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
     quest = get_or_assign_quest(cursor, player_id)
+    cursor.execute("SELECT board_stage FROM players WHERE player_id = ?", (player_id,))
+    _stage_row   = cursor.fetchone()
+    _board_stage = int(_stage_row[0]) if _stage_row and _stage_row[0] is not None else 0
     conn.commit()
     conn.close()
+    quest["base_reward"]   = quest["reward"]
+    quest["scaled_reward"] = int(quest["reward"] * _get_quest_multiplier(_board_stage))
     return {"status": "success", "quest": quest}
 
 
@@ -3266,7 +3501,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
         SELECT lifetime_cash_earned, best_survival_time, best_cashouts_run,
                best_combo, cursed_tiles_removed, total_runs, total_merges,
                high_tier_merges, best_session_merges, best_single_cashout,
-               peak_wallet_balance, total_money
+               peak_wallet_balance, total_money, board_stage
         FROM players
         WHERE player_id = ?
     """, (player_id,))
@@ -3292,6 +3527,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
         is_new_pb_cashout = True
     new_total_money      = int(row[11] or 0) + cash_earned
     peak_wallet_balance  = max(int(row[10] or 0), new_total_money)
+    board_stage_for_quest = int(row[12]) if row[12] is not None else 0
 
     cursor.execute("""
         UPDATE players
@@ -3331,7 +3567,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
         "cash_earned":     cash_earned,
         "run_merges":      run_merges,
         "run_combo_count": run_combo_count,
-    })
+    }, board_stage=board_stage_for_quest)
 
     combo_gems_awarded = min(run_combo_count // 3, 10)
     if combo_gems_awarded > 0:
