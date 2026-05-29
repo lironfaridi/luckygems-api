@@ -510,11 +510,14 @@ _SOFT_LAUNCH_COUNTRIES: set = set(
 )
 
 
-@functools.lru_cache(maxsize=2048)
-def _get_country_from_ip(ip: str) -> str:
-    """Returns ISO 3166-1 alpha-2 country code, or 'XX' on failure."""
-    if ip in ("127.0.0.1", "::1", "testclient"):
-        return "XX"   # local dev / test runner
+# Manual IP-to-country cache (replaces @functools.lru_cache, which cannot wrap async
+# functions).  Unbounded growth is acceptable: the unique-IP count for a mobile game
+# is small, and each entry is a 2-byte country code string.
+_IP_COUNTRY_CACHE: Dict[str, str] = {}
+
+
+def _lookup_country_blocking(ip: str) -> str:
+    """Synchronous urllib lookup — always called via asyncio.to_thread, never directly."""
     try:
         import urllib.request
         with urllib.request.urlopen(
@@ -525,6 +528,23 @@ def _get_country_from_ip(ip: str) -> str:
             return data.get("countryCode", "XX")
     except Exception:
         return "XX"
+
+
+async def _get_country_from_ip(ip: str) -> str:
+    """Returns ISO 3166-1 alpha-2 country code, or 'XX' on failure.
+
+    Cache-first: hits the in-process dict before making any network call.
+    On a cache miss the blocking urllib call is dispatched to a thread-pool
+    worker via asyncio.to_thread so the event loop is never stalled.
+    """
+    if ip in ("127.0.0.1", "::1", "testclient"):
+        return "XX"   # local dev / test runner
+    cached = _IP_COUNTRY_CACHE.get(ip)
+    if cached is not None:
+        return cached
+    country = await asyncio.to_thread(_lookup_country_blocking, ip)
+    _IP_COUNTRY_CACHE[ip] = country
+    return country
 
 
 def _issue_ad_token(player_id: str, context: str) -> str:
@@ -1645,7 +1665,7 @@ async def register_device(request: Request):
     # Existing authenticated players are never affected (this is /auth/register only).
     if _SOFT_LAUNCH_COUNTRIES:
         client_ip = request.client.host if request.client else ""
-        country   = _get_country_from_ip(client_ip)
+        country   = await _get_country_from_ip(client_ip)
         if country not in _SOFT_LAUNCH_COUNTRIES and country != "XX":
             raise HTTPException(
                 status_code=451,
