@@ -28,21 +28,23 @@ except ImportError:
 
 # Optional: receipt_validator.py validates Apple/Google store receipts.
 # IAP_SANDBOX=1 or BYPASS_RECEIPT_VALIDATION=true skips all store API calls.
+_receipt_validator_available: bool = False
 try:
     from receipt_validator import (
         validate_receipt      as _validate_receipt,
         verify_apple_receipt  as _verify_apple_receipt,
         verify_google_receipt as _verify_google_receipt,
     )
+    _receipt_validator_available = True
     print("[iap] receipt_validator loaded")
 except ImportError:
     async def _validate_receipt(platform, item_id, receipt, product_id):
-        return True
+        return False  # safe fallback: reject all receipts when validator is missing
     async def _verify_apple_receipt(receipt_data, is_sandbox):
         return {"valid": False, "error": "receipt_validator not installed"}
     async def _verify_google_receipt(package_name, product_id, purchase_token, credentials_json):
         return {"valid": False, "error": "receipt_validator not installed"}
-    print("[iap] receipt_validator not found -- validation disabled")
+    print("[iap] receipt_validator not found -- all IAP purchases will be rejected")
 
 # Optional Sentry integration. Set SENTRY_DSN to enable.
 # Requires: pip install sentry-sdk[fastapi]
@@ -56,9 +58,9 @@ if _SENTRY_DSN:
             dsn=_SENTRY_DSN,
             integrations=[StarletteIntegration(), FastApiIntegration()],
             traces_sample_rate=0.1,
-            environment=os.environ.get("ENV", "dev"),
+            environment=os.environ.get("APP_ENV", "development"),
         )
-        print(f"[observability] Sentry initialized (env={os.environ.get('ENV', 'dev')})")
+        print(f"[observability] Sentry initialized (env={os.environ.get('APP_ENV', 'development')})")
     except ImportError:
         print("[observability] sentry-sdk not installed -- Sentry disabled")
     except Exception as _sentry_err:
@@ -75,7 +77,7 @@ class V1StripMiddleware(BaseHTTPMiddleware):
             request.scope["path"]     = path[3:]          # "/v1/bank/balance" -> "/bank/balance"
             request.scope["raw_path"] = path[3:].encode()
         client_ver = request.headers.get("X-Client-Version", "")
-        if client_ver:
+        if client_ver and os.environ.get("APP_ENV", "development").lower() != "production":
             print(f"[api] client_version={client_ver} path={request.scope['path']}")
         _excluded_paths = {"/auth/register", "/health"}
         if (client_ver and MIN_CLIENT_VERSION != "0.0.0"
@@ -127,10 +129,15 @@ app.add_middleware(_MaxBodySizeMiddleware)
 # ---------------------------------------------------------------------------
 # Database configuration
 # Set DATABASE_URL for PostgreSQL (e.g. "postgresql://user:pass@host/db").
-# Leave unset (or set to empty string) to keep the local SQLite dev setup.
+# Leave unset (or set to empty string) to use the local SQLite dev setup.
 # Set REDIS_URL for caching   (e.g. "redis://localhost:6379/0").
 # ---------------------------------------------------------------------------
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://postgres.haeasmnauggorkourzqs:10Liron123!@aws-1-eu-central-1.pooler.supabase.com:6543/postgres").strip()
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL and os.environ.get("APP_ENV", "development").lower() == "production":
+    raise RuntimeError(
+        "FATAL: DATABASE_URL environment variable is not set. "
+        "Set it to your PostgreSQL connection string before starting the server in production."
+    )
 REDIS_URL:    str = os.environ.get("REDIS_URL",    "").strip()
 DB_NAME:      str = os.environ.get("SQLITE_DB",    "economy.db")  # SQLite path (dev only)
 
@@ -142,7 +149,7 @@ _IAP_SANDBOX_MODE: bool = (
 )
 _GOOGLE_CREDS_STR: str = os.getenv("GOOGLE_PLAY_CREDENTIALS_JSON", "").strip()
 _GOOGLE_PLAY_PACKAGE: str = os.getenv("GOOGLE_PLAY_PACKAGE",
-                                       "com.yourstudio.hostilemerg").strip()
+                                       "com.faridistudio.luckygems").strip()
 
 _USE_POSTGRES: bool = DATABASE_URL.startswith(("postgresql", "postgres"))
 
@@ -458,28 +465,33 @@ _AD_PENDING_TOKENS: Dict[str, Dict] = {}
 # The dev fallback is intentionally weak -- do NOT ship it.
 # ---------------------------------------------------------------------------
 _JWT_SECRET_DEFAULT = "hostile-merge-dev-secret-change-before-ship"
-_JWT_SECRET         = os.environ.get("JWT_SECRET", _JWT_SECRET_DEFAULT)
+_JWT_SECRET         = os.environ.get("JWT_SECRET", "").strip()
 _JWT_ALGORITHM      = "HS256"
-_JWT_USING_DEFAULT  = (_JWT_SECRET == _JWT_SECRET_DEFAULT)
 
-_ENV = os.environ.get("ENV", "dev").strip().lower()
+# APP_ENV is the single canonical env-mode variable used throughout this file.
+_ENV = os.environ.get("APP_ENV", "development").strip().lower()
 
-if _JWT_USING_DEFAULT:
-    if _ENV != "dev":
+# Covers both "not set" (empty string) and "still the dev placeholder" cases.
+_JWT_INSECURE = (not _JWT_SECRET or _JWT_SECRET == _JWT_SECRET_DEFAULT)
+
+if _JWT_INSECURE:
+    if _ENV == "production":
         raise RuntimeError(
             "\n\n"
-            "  CRITICAL: Insecure JWT_SECRET detected in production environment!\n"
-            "  Set the JWT_SECRET environment variable to a strong random secret\n"
-            "  before starting the server outside of dev mode.\n"
-            "  Example: export JWT_SECRET=$(python -c \"import secrets; print(secrets.token_hex(32))\")\n"
+            "  FATAL: JWT_SECRET is missing or set to the dev fallback in production!\n"
+            "  Generate a strong secret and set it as an environment variable:\n"
+            "  export JWT_SECRET=$(python -c \"import secrets; print(secrets.token_hex(32))\")\n"
         )
     else:
+        _JWT_SECRET = _JWT_SECRET_DEFAULT
         print(
             "\n"
             "  [security] WARNING: Running with the default dev JWT secret.\n"
             "  This is acceptable for local development ONLY.\n"
             "  Set JWT_SECRET before deploying to any shared or production environment.\n"
         )
+
+_JWT_USING_DEFAULT = (_JWT_SECRET == _JWT_SECRET_DEFAULT)
 
 # ---------------------------------------------------------------------------
 # Minimum client version enforcement
@@ -723,21 +735,22 @@ VAULT_BOOSTS = {
 }
 
 DAILY_REWARDS = {
-    1: {"gold":  2_000, "gems":  0, "free_spin": False,
+    # Values mirror VAULT_REWARDS in main_menu.gd -- both must stay in sync.
+    1: {"gold":    500, "gems":   0, "free_spin": False,
+        "label": "+$500 Gold"},
+    2: {"gold":      0, "gems":  15, "free_spin": False,
+        "label": "+15 Gems"},
+    3: {"gold":  2_000, "gems":   0, "free_spin": False,
         "label": "+$2,000 Gold"},
-    2: {"gold":      0, "gems":  3, "free_spin": False,
-        "label": "+3 Gems"},
-    3: {"gold":  2_000, "gems":  0, "free_spin": False,
-        "label": "+$2,000 Gold"},
-    4: {"gold":    500, "gems":  0, "free_spin": True,
+    4: {"gold":    500, "gems":   0, "free_spin": True,
         "label": "Free Spin + $500"},
-    5: {"gold":      0, "gems":  5, "free_spin": False,
-        "label": "+5 Gems"},
-    6: {"gold":  5_000, "gems":  0, "free_spin": False,
+    5: {"gold":      0, "gems":  30, "free_spin": False,
+        "label": "+30 Gems"},
+    6: {"gold":  5_000, "gems":   0, "free_spin": False,
         "label": "+$5,000 Gold"},
-    # Day 7: GRAND PRIZE -- Week-1 total = 23 gems so IAP remains meaningful.
-    7: {"gold": 10_000, "gems": 15, "free_spin": True,
-        "label": "GRAND PRIZE: +$10,000 + 15 Gems + Free Spin"},
+    # Day 7: GRAND PRIZE -- Week-1 gem total = 145, gold total = 8,000.
+    7: {"gold": 10_000, "gems": 100, "free_spin": False,
+        "label": "GRAND PRIZE: +$10,000 + 100 Gems"},
 }
 
 
@@ -1954,13 +1967,24 @@ async def get_config_flags(request: Request):
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    # Gate: refuse to start in production with the insecure dev JWT secret.
-    _env = os.environ.get("APP_ENV", "development").lower()
-    if _env == "production" and _JWT_SECRET == "hostile-merge-dev-secret-change-before-ship":
+    # Belt-and-suspenders: the module-level check already raises on import,
+    # but this catches any edge case where the guard was bypassed (e.g. test runner patching).
+    if os.environ.get("APP_ENV", "development").lower() == "production" and _JWT_INSECURE:
         raise RuntimeError(
-            "FATAL: JWT_SECRET is set to the dev fallback. "
+            "FATAL: JWT_SECRET is missing or insecure. "
             "Set a strong random secret via the JWT_SECRET environment variable before deploying."
         )
+    if os.environ.get("APP_ENV", "development").lower() == "production":
+        if _IAP_SANDBOX_MODE:
+            raise RuntimeError(
+                "FATAL: IAP_SANDBOX or BYPASS_RECEIPT_VALIDATION is enabled in production. "
+                "Unset IAP_SANDBOX and BYPASS_RECEIPT_VALIDATION before deploying."
+            )
+        if not _receipt_validator_available:
+            raise RuntimeError(
+                "FATAL: receipt_validator.py is missing from the deployment. "
+                "All IAP purchases will be rejected until it is installed."
+            )
     asyncio.create_task(market_recovery_loop())
 
 
@@ -6610,7 +6634,10 @@ async def qa_hard_reset(request: Request):
     starts a 100% fresh FTUE.  Intended for QA / FTUE smoke-testing only.
     The client deletes its local identity file and quits immediately after
     calling this endpoint, so the next run generates a brand-new player_id.
+    Disabled in production: returns 404 so the route is not discoverable.
     """
+    if os.environ.get("APP_ENV", "development").lower() == "production":
+        raise HTTPException(status_code=404)
     player_id = extract_player_id(request)
     try:
         conn   = get_connection()
@@ -6747,6 +6774,10 @@ async def clear_run_state(request: Request):
 
     return {"status": "success"}
 
-
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
+# if __name__ == "__main__":
+#     # Local development only. For production use the Procfile command below.
+#     # Procfile: web: uvicorn server:app --host 0.0.0.0 --port $PORT --workers 2
+#     uvicorn.run(app, host="127.0.0.1", port=8000, reload=True)
