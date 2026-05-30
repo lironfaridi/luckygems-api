@@ -676,8 +676,8 @@ def _award_free_gems(cursor, player_id: str, amount: int, today_str: str) -> int
         return 0
     cursor.execute(
         "UPDATE players "
-        "SET gems_balance       = gems_balance + ?, "
-        "    daily_gems_earned  = daily_gems_earned + ? "
+        "SET gems_balance      = COALESCE(gems_balance, 0) + ?, "
+        "    daily_gems_earned = COALESCE(daily_gems_earned, 0) + ? "
         "WHERE player_id = ?",
         (actual, actual, player_id)
     )
@@ -736,21 +736,21 @@ VAULT_BOOSTS = {
 
 DAILY_REWARDS = {
     # Values mirror VAULT_REWARDS in main_menu.gd -- both must stay in sync.
-    1: {"gold":    500, "gems":   0, "free_spin": False,
+    1: {"gold":   500, "gems":  0, "free_spin": False,
         "label": "+$500 Gold"},
-    2: {"gold":      0, "gems":  15, "free_spin": False,
-        "label": "+15 Gems"},
-    3: {"gold":  2_000, "gems":   0, "free_spin": False,
-        "label": "+$2,000 Gold"},
-    4: {"gold":    500, "gems":   0, "free_spin": True,
-        "label": "Free Spin + $500"},
-    5: {"gold":      0, "gems":  30, "free_spin": False,
-        "label": "+30 Gems"},
-    6: {"gold":  5_000, "gems":   0, "free_spin": False,
+    2: {"gold":     0, "gems": 10, "free_spin": False,
+        "label": "+10 Gems"},
+    3: {"gold": 2_500, "gems":  0, "free_spin": False,
+        "label": "+$2,500 Gold"},
+    4: {"gold": 1_000, "gems":  0, "free_spin": True,
+        "label": "Free Spin + $1,000"},
+    5: {"gold":     0, "gems": 25, "free_spin": False,
+        "label": "+25 Gems"},
+    6: {"gold": 5_000, "gems":  0, "free_spin": False,
         "label": "+$5,000 Gold"},
-    # Day 7: GRAND PRIZE -- Week-1 gem total = 145, gold total = 8,000.
-    7: {"gold": 10_000, "gems": 100, "free_spin": False,
-        "label": "GRAND PRIZE: +$10,000 + 100 Gems"},
+    # Day 7: GRAND PRIZE -- Week-1 gem total = 35, gold total = 14,000.
+    7: {"gold": 5_000, "gems": 50, "free_spin": False,
+        "label": "GRAND PRIZE: +$5,000 + 50 Gems"},
 }
 
 
@@ -912,6 +912,12 @@ def init_db():
 
     if not column_exists(cursor, "players", "piggy_smashes_today"):
         cursor.execute("ALTER TABLE players ADD COLUMN piggy_smashes_today INTEGER DEFAULT 0")
+
+    if not column_exists(cursor, "players", "total_piggy_smashes"):
+        cursor.execute("ALTER TABLE players ADD COLUMN total_piggy_smashes INTEGER DEFAULT 0")
+
+    if not column_exists(cursor, "players", "total_piggy_earnings"):
+        cursor.execute("ALTER TABLE players ADD COLUMN total_piggy_earnings INTEGER DEFAULT 0")
 
     if not column_exists(cursor, "players", "last_piggy_reset"):
         cursor.execute("ALTER TABLE players ADD COLUMN last_piggy_reset TEXT DEFAULT NULL")
@@ -2522,7 +2528,8 @@ def get_balance(request: Request):
                vault_pass_active, vault_pass_expiry, shards_balance, last_vault_pass_drip,
                is_rescue_active, rescue_active_since,
                install_date,
-               boost_active_until, boost_type
+               boost_active_until, boost_type,
+               total_runs
         FROM players
         WHERE player_id = ?{_lock_clause}
     """, (player_id,))
@@ -2786,6 +2793,7 @@ def get_balance(request: Request):
         "player_level":           _bal_level,
         "xp_in_level":            _bal_xp_bar["xp_in_level"],
         "xp_to_next_level":       _bal_xp_bar["xp_to_next_level"],
+        "total_runs":             int(row[35]) if row[35] is not None else 0,
     }
 
     # --- Redis cache write ---------------------------------------------------
@@ -2819,7 +2827,8 @@ def get_player_stats(request: Request):
         SELECT total_money, max_unlocked_tier, board_stage,
                lifetime_cash_earned, total_merges, best_survival_time,
                best_cashouts_run, best_combo, cursed_tiles_removed, total_runs,
-               gems_balance
+               gems_balance, total_piggy_smashes, best_single_cashout,
+               total_piggy_earnings
         FROM players
         WHERE player_id = ?
     """, (player_id,))
@@ -2858,11 +2867,12 @@ def get_player_stats(request: Request):
         },
         "records": {
             "lifetime_cash_earned": int(row[3]),
-            "total_merges": int(row[4]),
-            "best_survival_time": int(row[5]),
-            "best_cashouts_run": int(row[6]),
-            "best_combo": int(row[7]),
+            "total_merges":         int(row[4]),
+            "best_combo":           int(row[7]),
             "cursed_tiles_removed": int(row[8]),
+            "total_piggy_smashes":  int(row[11]) if row[11] is not None else 0,
+            "best_single_cashout":  int(row[12]) if row[12] is not None else 0,
+            "total_piggy_earnings": int(row[13]) if row[13] is not None else 0,
         },
         "achievements": all_achievements,
         "gems_balance": int(row[10]) if row[10] is not None else 0,
@@ -3259,11 +3269,15 @@ def check_and_unlock_achievements(cursor, player_id: str) -> List[Dict[str, Any]
             except Exception:
                 continue  # race or duplicate -- skip silently
 
-            unlock_achievement(cursor, player_id, ach_id)
-
-            gems = int(gems_list[tier_idx]) if tier_idx < len(gems_list) else 0
-            if gems > 0:
-                _award_free_gems(cursor, player_id, gems, today_str)
+            # Wrap secondary operations so a failure here cannot propagate out
+            # and roll back the achievement_claims INSERT above.
+            try:
+                unlock_achievement(cursor, player_id, ach_id)
+                gems = int(gems_list[tier_idx]) if tier_idx < len(gems_list) else 0
+                if gems > 0:
+                    _award_free_gems(cursor, player_id, gems, today_str)
+            except Exception:
+                gems = 0  # gem award failed silently; the claim was recorded
 
             newly_awarded.append({
                 "id":           ach_id,
@@ -3596,7 +3610,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     combo_gems_awarded = min(run_combo_count // 3, 10)
     if combo_gems_awarded > 0:
         cursor.execute(
-            "UPDATE players SET gems_balance = gems_balance + ? WHERE player_id = ?",
+            "UPDATE players SET gems_balance = COALESCE(gems_balance, 0) + ? WHERE player_id = ?",
             (combo_gems_awarded, player_id)
         )
 
@@ -3608,8 +3622,13 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     _gems_row = cursor.fetchone()
     new_gems_balance = int(_gems_row[0]) if _gems_row and _gems_row[0] is not None else 0
 
-    conn.commit()
-    conn.close()
+    try:
+        conn.commit()
+    except Exception as _commit_err:
+        print(f"[submit_run] commit error: {_commit_err}")
+        raise
+    finally:
+        conn.close()
 
     resp = {
         "status": "success",
@@ -5294,23 +5313,27 @@ async def piggy_smash(request: Request):
     if smash_type == "gems":
         cursor.execute(
             """UPDATE players SET
-                   total_money        = total_money + ?,
-                   piggy_balance      = 0,
-                   gems_balance       = gems_balance - ?,
-                   piggy_smashes_today = ?,
-                   last_piggy_reset   = ?
+                   total_money          = total_money + ?,
+                   piggy_balance        = 0,
+                   gems_balance         = gems_balance - ?,
+                   piggy_smashes_today  = ?,
+                   last_piggy_reset     = ?,
+                   total_piggy_smashes  = COALESCE(total_piggy_smashes, 0) + 1,
+                   total_piggy_earnings = COALESCE(total_piggy_earnings, 0) + ?
                WHERE player_id = ?""",
-            (reward, gem_cost, new_smashes_today, new_reset_str, player_id)
+            (reward, gem_cost, new_smashes_today, new_reset_str, reward, player_id)
         )
     else:
         cursor.execute(
             """UPDATE players SET
-                   total_money        = total_money + ?,
-                   piggy_balance      = 0,
-                   piggy_smashes_today = ?,
-                   last_piggy_reset   = ?
+                   total_money          = total_money + ?,
+                   piggy_balance        = 0,
+                   piggy_smashes_today  = ?,
+                   last_piggy_reset     = ?,
+                   total_piggy_smashes  = COALESCE(total_piggy_smashes, 0) + 1,
+                   total_piggy_earnings = COALESCE(total_piggy_earnings, 0) + ?
                WHERE player_id = ?""",
-            (reward, new_smashes_today, new_reset_str, player_id)
+            (reward, new_smashes_today, new_reset_str, reward, player_id)
         )
 
     cursor.execute(
@@ -6001,8 +6024,8 @@ async def purchase_starter_pack(request: Request):
 @app.post("/shop/starter_pack")
 async def shop_starter_pack(request: Request):
     """
-    Main in-game Starter Pack endpoint — the massive one-time offer shown on boot.
-    Grants 500 gems + 5,000 gold.  Uses the same has_seen_starter_pack column as
+    Main in-game Starter Pack endpoint — one-time offer shown after Run 2.
+    Grants 150 gems + 5,000 gold.  Uses the same has_seen_starter_pack column as
     /iap/starter_pack so purchasing via either route permanently closes the popup.
     """
     player_id, raw_token = extract_auth(request)
@@ -6022,7 +6045,7 @@ async def shop_starter_pack(request: Request):
         conn.close()
         return {"status": "error", "message": "already_purchased"}
 
-    STARTER_GEMS = 500
+    STARTER_GEMS = 150
     STARTER_GOLD = 5_000
 
     cursor.execute(
