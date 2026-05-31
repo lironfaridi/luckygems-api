@@ -5078,13 +5078,19 @@ async def player_rescue(request: Request):
     player_id, raw_token = extract_auth(request)
     await _verify_financial_signature(request, raw_token)
     raw_body = await request.body()
+    # Valid rescue costs mirror the client scoring formula: 5 / 10 / 15 / 20 gems.
+    _RESCUE_VALID_COSTS = {5, 10, 15, 20}
+    _RESCUE_COST_MAX    = max(_RESCUE_VALID_COSTS)
     try:
         body = json.loads(raw_body) if raw_body else {}
         cost = int(body.get("cost", 10))
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-    if cost <= 0:
-        return {"status": "error", "message": "Invalid cost"}
+    if cost not in _RESCUE_VALID_COSTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid rescue cost {cost}. Valid values: {sorted(_RESCUE_VALID_COSTS)}"
+        )
     conn = get_connection()
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
