@@ -13,6 +13,7 @@ import math
 import hmac
 import os
 import functools
+import logging
 from typing import List, Dict, Any
 
 # Requires: pip install PyJWT
@@ -408,6 +409,18 @@ _MAX_MERGES_PER_RUN     = 3_000
 _MAX_COMBO_VALUE        = 10          # realistically peaks at 3-4x
 _MAX_CURSED_REMOVED     = 500
 _MAX_COMBO_COUNT_RUN    = 500
+
+# Per-CALL deposit ceiling (interim anti-injection guard).
+# A single legitimate /bank/deposit is one of:
+#   * one cashout line (node_2d -> deposit_money(total_reward)), or
+#   * the Rush end-of-run 3x bonus (run_cashout_money * 2, a short ~60-130 s run).
+# Both are far below 1 M; the FULL run caps at _MAX_CASH_PER_RUN (5 M) across up to
+# _MAX_CASHOUTS_PER_RUN (300) separate deposits.  So 1 M per call never rejects a
+# legitimate packet, but blocks a hacked client from minting millions in one shot.
+# NOTE: this is interim.  The real fix is server-derived payouts (client sends the
+# board event; server computes the reward).  A cumulative per-run deposit cap keyed
+# to board stage is the recommended next step -- see audit.
+_MAX_DEPOSIT_PER_CALL   = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -2516,6 +2529,20 @@ async def deposit_money(request: Request):
         amount = int(body.get("amount", 0))
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Anti-injection ceiling: positive deposits only.  Negative amounts are
+    # tool-spend withdrawals (server-priced on the client) and are left alone --
+    # a cheater gains nothing by removing their own gold.
+    if amount > _MAX_DEPOSIT_PER_CALL:
+        logging.warning(
+            "ANTICHEAT deposit_over_cap player=%s amount=%s cap=%s",
+            player_id, amount, _MAX_DEPOSIT_PER_CALL,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "amount_rejected",
+                    "message": "Deposit exceeds the per-transaction limit."}
+        )
 
     conn = get_connection()
     cursor = conn.cursor()
