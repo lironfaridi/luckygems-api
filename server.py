@@ -958,6 +958,9 @@ def init_db():
     if not column_exists(cursor, "players", "last_welcome_back_date"):
         cursor.execute("ALTER TABLE players ADD COLUMN last_welcome_back_date TEXT DEFAULT NULL")
 
+    if not column_exists(cursor, "players", "last_rush_date"):
+        cursor.execute("ALTER TABLE players ADD COLUMN last_rush_date TEXT DEFAULT NULL")
+
     # telemetry_logs must exist before any ALTER TABLE checks against it.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS telemetry_logs (
@@ -2035,7 +2038,12 @@ async def claim_quest(request: Request, quest_id: str):
     conn.commit()
     conn.close()
     _invalidate_balance_cache(player_id)
-    return {"status": "success", "gems_awarded": actual_quest_gems, "new_gems_balance": new_gems}
+    return {
+        "status":          "success",
+        "gems_awarded":    actual_quest_gems,
+        "new_gems_balance": new_gems,
+        "cap_reached":     actual_quest_gems < purple_gems,
+    }
 
 
 @app.post("/achievements/claim")
@@ -2079,7 +2087,12 @@ async def claim_achievement_tier(request: Request, ach_id: str, tier: int):
     conn.commit()
     conn.close()
     _invalidate_balance_cache(player_id)
-    resp_a = {"status": "success", "gems_awarded": actual_ach_gems, "new_gems_balance": new_gems}
+    resp_a = {
+        "status":           "success",
+        "gems_awarded":     actual_ach_gems,
+        "new_gems_balance": new_gems,
+        "cap_reached":      actual_ach_gems < gems_award,
+    }
     resp_a.update(xp_info_a)
     return resp_a
 
@@ -2148,6 +2161,85 @@ async def add_to_piggy(request: Request, amount: int):
     conn.close()
     return {"status": "success", "piggy_balance": new_piggy, "cap": cap}
 
+
+
+@app.get("/rush/status")
+async def get_rush_status(request: Request):
+    """
+    Returns whether The Rush daily challenge is available for this player today
+    and how many seconds remain until the next midnight reset (UTC).
+
+    Response:
+        is_available          bool -- True if player has not played The Rush today.
+        seconds_until_midnight int  -- Client uses this to drive a local countdown
+                                       without polling. Re-fetch on expiry.
+        last_rush_date        str | None -- ISO date of last attempt, for debugging.
+    Always 200; never reveals private data.
+    """
+    player_id = extract_player_id(request)
+    now_utc   = datetime.datetime.utcnow()
+    today_str = now_utc.date().isoformat()
+
+    # Seconds from right now until the next UTC midnight.
+    midnight_utc        = datetime.datetime(now_utc.year, now_utc.month, now_utc.day) \
+                          + datetime.timedelta(days=1)
+    seconds_until_reset = max(0, int((midnight_utc - now_utc).total_seconds()))
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        get_or_create_player(player_id, cursor)
+        cursor.execute(
+            "SELECT last_rush_date FROM players WHERE player_id = ?",
+            (player_id,)
+        )
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+
+    last_rush_date = row[0] if row else None
+    is_available   = (last_rush_date is None) or (last_rush_date != today_str)
+
+    return {
+        "is_available":           is_available,
+        "seconds_until_midnight": seconds_until_reset,
+        "last_rush_date":         last_rush_date,
+    }
+
+
+@app.post("/rush/start")
+async def start_rush(request: Request):
+    """
+    Called the moment the player enters The Rush scene.
+    Stamps last_rush_date = today (UTC) so the button locks immediately.
+    Returns the same payload as /rush/status so the client can sync in one round-trip.
+    Idempotent: safe to call twice (stamps the same date, returns already-played).
+    """
+    player_id = extract_player_id(request)
+    now_utc   = datetime.datetime.utcnow()
+    today_str = now_utc.date().isoformat()
+
+    midnight_utc        = datetime.datetime(now_utc.year, now_utc.month, now_utc.day) \
+                          + datetime.timedelta(days=1)
+    seconds_until_reset = max(0, int((midnight_utc - now_utc).total_seconds()))
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        get_or_create_player(player_id, cursor)
+        cursor.execute(
+            "UPDATE players SET last_rush_date = ? WHERE player_id = ?",
+            (today_str, player_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "is_available":           False,
+        "seconds_until_midnight": seconds_until_reset,
+        "last_rush_date":         today_str,
+    }
 
 
 @app.post("/player/claim_daily")
@@ -2468,7 +2560,8 @@ async def deposit_money(request: Request):
         if last_bonus_date != today_dep:
             first_cashout_bonus_gems = 5
             cursor.execute(
-                "UPDATE players SET gems_balance = gems_balance + 5, last_first_cashout_bonus_date = ? WHERE player_id = ?",
+                "UPDATE players SET gems_balance = COALESCE(gems_balance, 0) + 5, "
+                "last_first_cashout_bonus_date = ? WHERE player_id = ?",
                 (today_dep, player_id)
             )
 
@@ -6152,26 +6245,17 @@ def _credit_gem_bundle(player_id: str, product_id: str, cursor) -> Dict[str, Any
     gold       = int(bundle.get("gold", 0))
     price_usd  = float(bundle["usd"])
 
-    # Check first-purchase bonus before crediting
-    cursor.execute(
-        "SELECT first_iap_done FROM players WHERE player_id = ?", (player_id,)
-    )
-    row_fip = cursor.fetchone()
-    first_iap_done = int(row_fip[0]) if row_fip and row_fip[0] is not None else 0
-
-    bonus_gems        = 0
-    first_purchase    = False
-    if first_iap_done == 0:
-        bonus_gems     = gems * 9      # base + 9x = 10x total
-        first_purchase = True
-
-    total_gems = gems + bonus_gems
+    # First-purchase bonus removed: frontend bundle cards show exact gem amounts and
+    # the server must credit exactly those amounts (frontend is source of truth).
+    bonus_gems     = 0
+    first_purchase = False
+    total_gems     = gems
 
     cursor.execute(
         """UPDATE players
-               SET gems_balance      = gems_balance      + ?,
-                   total_money       = total_money       + ?,
-                   lifetime_iap_usd  = lifetime_iap_usd  + ?,
+               SET gems_balance      = COALESCE(gems_balance,     0) + ?,
+                   total_money       = COALESCE(total_money,      0) + ?,
+                   lifetime_iap_usd  = COALESCE(lifetime_iap_usd, 0.0) + ?,
                    first_iap_done    = 1
            WHERE player_id = ?""",
         (total_gems, gold, price_usd, player_id)
@@ -6185,7 +6269,7 @@ def _credit_gem_bundle(player_id: str, product_id: str, cursor) -> Dict[str, Any
         (player_id, 0, price_usd)
     )
 
-    # Separate log entry for the bonus (audit trail)
+    # Bonus log entry retained as dead branch so the audit trail code compiles.
     if first_purchase and bonus_gems > 0:
         cursor.execute(
             "INSERT INTO sales_log (seller, item_level, profit_made) VALUES (?, ?, ?)",
@@ -6769,7 +6853,7 @@ def get_active_run_state(request: Request):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT state_json FROM run_states WHERE player_id = ?",
+            "SELECT state_json, saved_at FROM run_states WHERE player_id = ?",
             (player_id,)
         )
         row = cursor.fetchone()
@@ -6786,6 +6870,10 @@ def get_active_run_state(request: Request):
         return {"status": "none"}
 
     state["status"] = "ok"
+    # Expose the DB-stamped save time so the client can compute idle duration
+    # for the session_resume telemetry event.
+    if row[1]:
+        state["saved_at"] = str(row[1])
     return state
 
 
