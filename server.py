@@ -23,8 +23,10 @@ import jwt
 # Gracefully degrades to no-op when the module is absent.
 try:
     from push_service import send_push_to_player as _push_player
+    from push_service import push_status as _push_status
 except ImportError:
-    def _push_player(*_a, **_k): pass
+    def _push_player(*_a, **_k): return {"tokens": 0, "sent": 0, "failed": 0}
+    def _push_status(): return {"fcm": False, "apns": False}
     print("[push] push_service not available -- push disabled")
 
 # Optional: receipt_validator.py validates Apple/Google store receipts.
@@ -421,6 +423,12 @@ _MAX_COMBO_COUNT_RUN    = 500
 # board event; server computes the reward).  A cumulative per-run deposit cap keyed
 # to board stage is the recommended next step -- see audit.
 _MAX_DEPOSIT_PER_CALL   = 1_000_000
+
+# Server-derived cashout payouts (the authoritative gold source).
+GOLDEN_TILE_CASHOUT_MULT = 4          # mirrors node_2d.golden_tile_cashout_multiplier
+_MAX_CASHOUT_PAYOUT      = 1_000_000  # per-cashout ceiling (anti-cheat clamp)
+_MAX_CASHOUT_LINES       = 16         # sane upper bound on simultaneous lines
+_MAX_CASHOUT_LINE_LEN    = 8          # max board edge
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +967,18 @@ def init_db():
     if not column_exists(cursor, "players", "has_seen_starter_pack"):
         cursor.execute("ALTER TABLE players ADD COLUMN has_seen_starter_pack INTEGER DEFAULT 0")
 
+    # --- Push notification bookkeeping (retention) ---
+    if not column_exists(cursor, "players", "piggy_full_since"):
+        cursor.execute("ALTER TABLE players ADD COLUMN piggy_full_since TEXT DEFAULT NULL")
+    if not column_exists(cursor, "players", "piggy_full_notified"):
+        cursor.execute("ALTER TABLE players ADD COLUMN piggy_full_notified INTEGER DEFAULT 0")
+    if not column_exists(cursor, "players", "last_rush_reminder_date"):
+        cursor.execute("ALTER TABLE players ADD COLUMN last_rush_reminder_date TEXT DEFAULT NULL")
+
+    # --- COPPA age bracket: NULL = unknown, 0 = 13+, 1 = under 13 (child-directed) ---
+    if not column_exists(cursor, "players", "age_under_13"):
+        cursor.execute("ALTER TABLE players ADD COLUMN age_under_13 INTEGER DEFAULT NULL")
+
     if not column_exists(cursor, "players", "unlocked_cosmetics"):
         cursor.execute("ALTER TABLE players ADD COLUMN unlocked_cosmetics TEXT DEFAULT '[]'")
 
@@ -1211,6 +1231,22 @@ def init_db():
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_device_tokens_player "
         "ON device_tokens (player_id)"
+    )
+
+    # --- Push delivery audit log ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS push_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id  TEXT NOT NULL,
+            push_type  TEXT,
+            tokens     INTEGER DEFAULT 0,
+            sent       INTEGER DEFAULT 0,
+            failed     INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_push_log_player ON push_log (player_id)"
     )
 
     # --- IAP receipt idempotency log ---
@@ -1989,6 +2025,9 @@ async def get_config_flags(request: Request):
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    _ps = _push_status()
+    print("[push] startup: FCM=%s  APNs=%s"
+          % ("on" if _ps["fcm"] else "OFF", "on" if _ps["apns"] else "OFF"))
     # Belt-and-suspenders: the module-level check already raises on import,
     # but this catches any edge case where the guard was bypassed (e.g. test runner patching).
     if os.environ.get("APP_ENV", "development").lower() == "production" and _JWT_INSECURE:
@@ -2008,6 +2047,7 @@ async def startup_event():
                 "All IAP purchases will be rejected until it is installed."
             )
     asyncio.create_task(market_recovery_loop())
+    asyncio.create_task(push_reminder_loop())
 
 
 async def market_recovery_loop():
@@ -2021,6 +2061,175 @@ async def market_recovery_loop():
         except Exception as _loop_err:
             print(f"[market_recovery_loop] ERROR: {_loop_err} -- retrying in 10 s")
             await asyncio.sleep(10)
+
+
+# ---------------------------------------------------------------------------
+# Retention push sweep.  Runs every few minutes and dispatches:
+#   * Piggy-full nudge   -- once the player has been idle past a grace window
+#                           (we never push while they're mid-session).
+#   * Daily Rush ready   -- when The Rush has reset and they were recently active.
+# Sends route through push_service (_push_player), which no-ops when push is not
+# configured, so this loop is safe in every environment.
+# ---------------------------------------------------------------------------
+_PUSH_SWEEP_INTERVAL_SECS = 300
+_PIGGY_IDLE_GRACE_MINS    = 40    # wait after fill before nudging (avoid mid-run)
+_RUSH_REENGAGE_MAX_DAYS   = 7     # don't nag players who already churned
+_PUSH_SWEEP_BATCH         = 200   # cap rows touched per pass
+
+
+async def push_reminder_loop():
+    while True:
+        await asyncio.sleep(_PUSH_SWEEP_INTERVAL_SECS)
+        try:
+            await asyncio.to_thread(_run_push_sweep)
+        except asyncio.CancelledError:
+            raise  # clean shutdown -- do not swallow
+        except Exception as _err:
+            print(f"[push_reminder_loop] ERROR: {_err}")
+
+
+def _run_push_sweep() -> None:
+    """Synchronous DB sweep; always invoked via asyncio.to_thread so the event
+    loop is never stalled by the blocking DB / push network calls."""
+    now       = datetime.datetime.utcnow()
+    today_str = now.date().isoformat()
+    cutoff_7d = (now.date() - datetime.timedelta(days=_RUSH_REENGAGE_MAX_DAYS)).isoformat()
+
+    piggy_to_push: list = []
+    piggy_to_clear: list = []
+    rush_to_push: list = []
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # --- 1) Piggy Bank full (candidates stamped by add_to_piggy) ---
+        cursor.execute(
+            "SELECT player_id, piggy_balance, mastery_state, piggy_full_since "
+            "FROM players WHERE piggy_full_notified = 0 AND piggy_full_since IS NOT NULL "
+            "LIMIT ?",
+            (_PUSH_SWEEP_BATCH,)
+        )
+        for pid, piggy_balance, mastery_state, full_since in cursor.fetchall():
+            cap = get_piggy_cap(mastery_state)
+            if int(piggy_balance or 0) < cap:
+                piggy_to_clear.append(pid)   # already smashed -> reset, no push
+                continue
+            try:
+                filled_at = datetime.datetime.fromisoformat(str(full_since))
+            except (ValueError, TypeError):
+                filled_at = now
+            if (now - filled_at).total_seconds() >= _PIGGY_IDLE_GRACE_MINS * 60:
+                piggy_to_push.append(pid)
+
+        # --- 2) Daily Rush ready (reset since their last play, recently active) ---
+        cursor.execute(
+            "SELECT player_id FROM players "
+            "WHERE last_rush_date IS NOT NULL AND last_rush_date < ? AND last_rush_date >= ? "
+            "AND (last_rush_reminder_date IS NULL OR last_rush_reminder_date < ?) "
+            "LIMIT ?",
+            (today_str, cutoff_7d, today_str, _PUSH_SWEEP_BATCH)
+        )
+        rush_to_push = [r[0] for r in cursor.fetchall()]
+
+        # Mark state BEFORE sending so a slow/failed send can't cause re-spam.
+        for pid in piggy_to_clear:
+            cursor.execute(
+                "UPDATE players SET piggy_full_since = NULL, piggy_full_notified = 0 "
+                "WHERE player_id = ?", (pid,)
+            )
+        for pid in piggy_to_push:
+            cursor.execute(
+                "UPDATE players SET piggy_full_notified = 1 WHERE player_id = ?", (pid,)
+            )
+        for pid in rush_to_push:
+            cursor.execute(
+                "UPDATE players SET last_rush_reminder_date = ? WHERE player_id = ?",
+                (today_str, pid)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Dispatch OUTSIDE the DB transaction (each _push_player opens its own conn).
+    for pid in piggy_to_push:
+        res = _push_player(
+            pid,
+            "Your Piggy Bank is full \U0001F437",
+            "Crack it open now before it overflows!",
+            {"type": "piggy_full"},
+        )
+        _log_push(pid, "piggy_full", res)
+    for pid in rush_to_push:
+        res = _push_player(
+            pid,
+            "The Rush is ready! ⏳",
+            "Beat the clock for 3x Payouts.",
+            {"type": "rush_ready"},
+        )
+        _log_push(pid, "rush_ready", res)
+
+
+def _log_push(player_id: str, push_type: str, result: dict) -> None:
+    """Record a push dispatch in push_log for delivery auditing.  Best-effort."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO push_log (player_id, push_type, tokens, sent, failed, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (player_id, push_type,
+             int(result.get("tokens", 0)), int(result.get("sent", 0)),
+             int(result.get("failed", 0)), datetime.datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as _e:
+        print(f"[push_log] failed to record {push_type} for {player_id}: {_e}")
+
+
+@app.post("/admin/push_test")
+async def admin_push_test(request: Request):
+    """Admin-only: send a test push to a player_id.  Guarded by the
+    ADMIN_PUSH_SECRET env var (must match the X-Admin-Secret header).
+    Returns the transport config + per-token send result for diagnosis."""
+    secret = os.environ.get("ADMIN_PUSH_SECRET", "")
+    if not secret or request.headers.get("X-Admin-Secret", "") != secret:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        body   = await request.json()
+        target = str(body.get("player_id", "")).strip()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not target:
+        raise HTTPException(status_code=400, detail="player_id is required")
+    result = _push_player(target, "Hostile Merge",
+                          "Admin test push -- delivery check.",
+                          {"type": "admin_test"})
+    _log_push(target, "admin_test", result)
+    return {"status": "ok", "config": _push_status(), "result": result}
+
+
+@app.post("/player/set_age")
+async def set_age(request: Request):
+    """Record the COPPA age bracket chosen at the first-launch age gate.
+    Body: {"under_13": bool}.  Idempotent; client also persists locally."""
+    player_id = extract_player_id(request)
+    try:
+        body     = await request.json()
+        under_13 = 1 if bool(body.get("under_13", False)) else 0
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    conn   = get_connection()
+    cursor = conn.cursor()
+    get_or_create_player(player_id, cursor)
+    cursor.execute(
+        "UPDATE players SET age_under_13 = ? WHERE player_id = ?",
+        (under_13, player_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "age_under_13": under_13}
 
 
 @app.post("/quests/claim")
@@ -2170,6 +2379,16 @@ async def add_to_piggy(request: Request, amount: int):
         "UPDATE players SET piggy_balance = ? WHERE player_id = ?",
         (new_piggy, player_id)
     )
+    # Stamp the moment the bank FILLS (transition into cap).  We do NOT push here:
+    # the piggy fills mid-run, and "come crack it open" while the player is already
+    # playing is bad UX (and risks Play policy on misleading notifications).  The
+    # reminder sweep dispatches the push once the player has gone idle.
+    if current_piggy < cap and new_piggy >= cap:
+        cursor.execute(
+            "UPDATE players SET piggy_full_since = ?, piggy_full_notified = 0 "
+            "WHERE player_id = ?",
+            (datetime.datetime.utcnow().isoformat(), player_id)
+        )
     conn.commit()
     conn.close()
     return {"status": "success", "piggy_balance": new_piggy, "cap": cap}
@@ -2505,6 +2724,140 @@ async def sell_item(request: Request, item_level: int, board: List[int] = Body(.
         "status": "BANKRUPT" if balance < 0 else "SUCCESS",
         "profit": profit,
         "new_balance": balance
+    }
+
+
+@app.post("/cashout")
+async def cashout(request: Request):
+    """
+    SERVER-DERIVED cashout payout (replaces client-declared deposits for the main
+    gold source).  The client reports the EVENT FACTS; the server computes the
+    reward from its own board-adjusted market prices + multipliers, so a modded
+    client cannot inflate the amount.
+
+    Body: {
+      "board":        [int],   # PRE-CLEAR board snapshot (for board-adjusted pricing)
+      "tier":         int,     # cashout_target_tier
+      "line_lengths": [int],   # length of each cashout line (one entry per line)
+      "golden_tile":  bool,    # whether a golden tile was part of the cashout
+      "combo_value":  int      # cascade combo counter (-> combo bonus pct)
+    }
+    Mirrors node_2d.calculate_cashout_reward + the combo/golden/bonus math exactly.
+    """
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    if not _check_burst_limit(player_id, "cashout", 20, 60.0):
+        raise HTTPException(
+            status_code=429,
+            detail={"status": "rate_limited", "message": "Too many cashouts -- slow down."}
+        )
+
+    try:
+        body         = await request.json()
+        board        = body.get("board", [])
+        tier         = int(body.get("tier", 0))
+        line_lengths = body.get("line_lengths", [])
+        golden       = bool(body.get("golden_tile", False))
+        combo_value  = int(body.get("combo_value", 1))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # --- Input validation ---
+    if not isinstance(board, list) or not (0 < len(board) <= 64):
+        raise HTTPException(status_code=400, detail="invalid board")
+    if not isinstance(line_lengths, list) or not (0 < len(line_lengths) <= _MAX_CASHOUT_LINES):
+        raise HTTPException(status_code=400, detail="invalid line_lengths")
+    if not (1 <= tier <= 99):
+        raise HTTPException(status_code=400, detail="invalid tier")
+    safe_lengths = []
+    for L in line_lengths:
+        try:
+            Li = int(L)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="invalid line length")
+        if not (2 <= Li <= _MAX_CASHOUT_LINE_LEN):
+            raise HTTPException(status_code=400, detail="invalid line length")
+        safe_lengths.append(Li)
+
+    # Anti-cheat: the board must actually hold enough tier (or golden) tiles to back
+    # the claimed lines.  Bounds fabricated multi-line claims without a full re-detect.
+    needed = sum(safe_lengths)
+    have   = board.count(tier) + (board.count(GOLDEN_TILE_VALUE) if golden else 0)
+    if have < needed:
+        logging.warning("ANTICHEAT cashout_claim_exceeds_board player=%s need=%s have=%s",
+                        player_id, needed, have)
+        raise HTTPException(status_code=400, detail="claim exceeds board tiles")
+
+    # --- Authoritative, board-adjusted price (same fn the client polls via /prices) ---
+    prices     = calculate_adjusted_prices(board)
+    base_price = max(1, int(prices.get(tier, 1)))
+
+    # --- Reproduce node_2d payout math EXACTLY ---
+    def _length_mult(n: int) -> float:
+        if n == 4: return 1.6
+        if n == 5: return 2.4
+        if n >= 6: return 3.5
+        return 1.0
+
+    base_reward = 0
+    for L in safe_lengths:
+        base_reward += int(base_price * L * _length_mult(L))
+
+    num_lines        = len(safe_lengths)
+    combo_multiplier = 3 if num_lines >= 3 else (2 if num_lines == 2 else 1)
+    total            = base_reward * combo_multiplier
+    if golden:
+        total *= GOLDEN_TILE_CASHOUT_MULT
+
+    if   combo_value >= 7: bonus_pct = 0.15
+    elif combo_value >= 4: bonus_pct = 0.10
+    elif combo_value >= 2: bonus_pct = 0.05
+    else:                  bonus_pct = 0.0
+    if bonus_pct > 0.0:
+        total = int(total * (1.0 + bonus_pct))
+
+    total = max(0, total)
+    if total > _MAX_CASHOUT_PAYOUT:
+        logging.warning("ANTICHEAT cashout_over_cap player=%s total=%s", player_id, total)
+        total = _MAX_CASHOUT_PAYOUT
+
+    # --- Credit + Vault Pass 1.5x (same rule as /bank/deposit) ---
+    conn   = get_connection()
+    cursor = conn.cursor()
+    get_or_create_player(player_id, cursor)
+
+    vault_pass_bonus = 0
+    if total > 0:
+        cursor.execute(
+            "SELECT vault_pass_active, vault_pass_expiry FROM players WHERE player_id = ?",
+            (player_id,)
+        )
+        _vp = cursor.fetchone()
+        _vp_on  = bool(int(_vp[0]) if _vp and _vp[0] is not None else 0)
+        _vp_exp = str(_vp[1]) if _vp and _vp[1] is not None else ""
+        if _vp_on and _vp_exp:
+            try:
+                if datetime.datetime.utcnow() < datetime.datetime.fromisoformat(_vp_exp):
+                    vault_pass_bonus = int(total * 0.5)
+                    total += vault_pass_bonus
+            except (ValueError, OverflowError):
+                pass
+
+    cursor.execute(
+        "UPDATE players SET total_money = total_money + ? WHERE player_id = ?",
+        (total, player_id)
+    )
+    cursor.execute("SELECT total_money FROM players WHERE player_id = ?", (player_id,))
+    new_balance = int(cursor.fetchone()[0])
+    conn.commit()
+    conn.close()
+    _invalidate_balance_cache(player_id)
+
+    return {
+        "status":           "success",
+        "granted":          total,
+        "vault_pass_bonus": vault_pass_bonus,
+        "new_balance":      new_balance,
     }
 
 
@@ -6096,19 +6449,65 @@ async def iap_verify(request: Request):
 @app.post("/iap/starter_pack")
 async def purchase_starter_pack(request: Request):
     """
-    One-time Starter Pack offer.  Credits 250 gems + 1,000 gold and sets
-    has_seen_starter_pack = 1 so the popup never fires again.
-    Returns an error if already purchased.
-    The client sends an empty JSON body '{}' so the HMAC covers a deterministic string.
+    One-time REAL-MONEY Starter Pack IAP ($0.99).  Validates the store receipt
+    (same path as /iap/validate/google), enforces single-use via iap_receipts,
+    then credits 250 gems + 1,000 gold and sets has_seen_starter_pack = 1.
+
+    Body: {"product_id", "purchase_token", "package_name", "platform"}
+    Dev bypass: any non-empty token is accepted when APP_ENV != "production".
     """
     player_id, raw_token = extract_auth(request)
     await _verify_financial_signature(request, raw_token)
 
+    try:
+        body           = await request.json()
+        purchase_token = str(body.get("purchase_token", "")).strip()
+        platform       = str(body.get("platform", "android")).strip().lower()
+        package_name   = str(body.get("package_name", _GOOGLE_PLAY_PACKAGE)).strip()
+        product_id     = str(body.get("product_id", "starter_pack")).strip()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not purchase_token:
+        raise HTTPException(status_code=400, detail="purchase_token is required")
+
+    # --- Receipt validation (production only; dev accepts any non-empty token) ---
+    app_env = os.environ.get("APP_ENV", "development").lower()
+    if app_env == "production":
+        if platform != "android":
+            # iOS Starter Pack receipt validation is not wired yet -- refuse rather
+            # than grant on an unvalidated token.  (Launch target is Google Play.)
+            raise HTTPException(status_code=400, detail="starter_pack IAP is Android-only for now")
+        try:
+            creds: dict = json.loads(_GOOGLE_CREDS_STR) if _GOOGLE_CREDS_STR else {}
+            result = await _verify_google_receipt(
+                package_name=package_name,
+                product_id=product_id,
+                purchase_token=purchase_token,
+                credentials_json=creds,
+            )
+            if not result.get("valid"):
+                raise HTTPException(status_code=402, detail="receipt_invalid")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=402, detail="receipt_invalid")
+
+    transaction_id = purchase_token   # Play uses the purchase token as the unique id
     conn   = get_connection()
     cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
-    conn.commit()
 
+    # Idempotency: reject replayed receipts before touching balances.
+    cursor.execute(
+        "SELECT id FROM iap_receipts WHERE transaction_id = ?", (transaction_id,)
+    )
+    if cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Transaction already processed")
+
+    get_or_create_player(player_id, cursor)
+
+    # One-time gate: a player may only ever own the Starter Pack once.
     cursor.execute(
         "SELECT has_seen_starter_pack FROM players WHERE player_id = ?",
         (player_id,)
@@ -6120,14 +6519,23 @@ async def purchase_starter_pack(request: Request):
 
     STARTER_GEMS = 250
     STARTER_GOLD = 1_000
+    STARTER_USD  = 0.99
 
     cursor.execute(
         """UPDATE players
-               SET gems_balance          = gems_balance + ?,
-                   total_money           = total_money  + ?,
+               SET gems_balance          = gems_balance     + ?,
+                   total_money           = total_money      + ?,
+                   lifetime_iap_usd      = lifetime_iap_usd + ?,
                    has_seen_starter_pack = 1
            WHERE player_id = ?""",
-        (STARTER_GEMS, STARTER_GOLD, player_id)
+        (STARTER_GEMS, STARTER_GOLD, STARTER_USD, player_id)
+    )
+    cursor.execute(
+        """INSERT INTO iap_receipts
+               (player_id, transaction_id, product_id, platform, usd_amount, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (player_id, transaction_id, product_id, platform, STARTER_USD,
+         datetime.datetime.utcnow().isoformat())
     )
     cursor.execute(
         "SELECT gems_balance, total_money FROM players WHERE player_id = ?",
