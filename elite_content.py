@@ -12,6 +12,7 @@
 # =============================================================================
 import time
 import threading
+import json
 
 CONTENT_VERSION = 1
 MIN_SUPPORTED_CONTENT_VERSION = 1
@@ -131,6 +132,11 @@ class EliteStore:
                 self._r = None
         self.backend = "redis" if self._r is not None else "memory"
         print("[elite] EliteStore backend = %s" % self.backend)
+        # Local-dev persistence: with NO Redis, mirror the in-memory state to a JSON
+        # file next to this module so dev data survives Uvicorn restarts.
+        self._LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_state.json")
+        if self._r is None:
+            self._load_local()
 
     # ---- set ops (string members) ----
     def sadd(self, key, member):
@@ -140,6 +146,7 @@ class EliteStore:
         else:
             with self._lock:
                 self._mem.setdefault(key, set()).add(m)
+                self._save_local()
 
     def smembers(self, key):
         if self._r is not None:
@@ -168,6 +175,7 @@ class EliteStore:
         else:
             with self._lock:
                 self._mem.setdefault(key, {})[field] = str(value)
+                self._save_local()
 
     def hincrby(self, key, field, amount):
         if self._r is not None:
@@ -175,7 +183,48 @@ class EliteStore:
         with self._lock:
             d = self._mem.setdefault(key, {})
             d[field] = str(int(d.get(field, "0")) + int(amount))
+            self._save_local()
             return int(d[field])
+
+    # ---- local-dev JSON persistence (fallback branch only; Redis untouched) ----
+    def _save_local(self):
+        # Caller MUST hold self._lock (we do NOT re-acquire -- Lock isn't reentrant).
+        if self._r is not None:
+            return
+        try:
+            out = {}
+            for k, v in self._mem.items():
+                if isinstance(v, set):
+                    out[k] = {"__t": "set", "v": sorted(v)}
+                elif isinstance(v, dict):
+                    out[k] = {"__t": "hash", "v": dict(v)}
+            tmp = self._LOCAL_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(out, f)
+            os.replace(tmp, self._LOCAL_PATH)   # atomic; never leaves a half-written file
+        except Exception as _e:
+            print("[elite] _save_local failed: %s" % _e)
+
+    def _load_local(self):
+        # Crash-safe: a missing or corrupt file simply starts fresh.
+        try:
+            if not os.path.exists(self._LOCAL_PATH):
+                return
+            with open(self._LOCAL_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            mem = {}
+            for k, rec in raw.items():
+                t = rec.get("__t")
+                v = rec.get("v")
+                if t == "set":
+                    mem[k] = set(str(x) for x in (v or []))
+                elif t == "hash":
+                    mem[k] = {str(fk): str(fv) for fk, fv in (v or {}).items()}
+            self._mem = mem
+            print("[elite] loaded local_state.json (%d keys)" % len(self._mem))
+        except Exception as _e:
+            print("[elite] _load_local failed (%s) -- starting fresh" % _e)
+            self._mem = {}
 
 
 STORE = EliteStore()
