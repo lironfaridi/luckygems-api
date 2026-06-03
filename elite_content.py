@@ -103,29 +103,130 @@ CATALOGS = {
 }
 
 # -----------------------------------------------------------------------------
-#  In-memory mock state (resets on restart). Real impl -> DB tables.
+#  Persistent shared state (multi-worker fix): EliteStore prefers Redis -- which is
+#  cross-worker consistent AND survives restarts -- and transparently falls back to
+#  in-process dicts when REDIS_URL is unset (local dev / single worker). The
+#  threading.Lock guards ONLY the in-memory fallback; with Redis, Redis itself is
+#  the cross-process sync point. Public function signatures are UNCHANGED, so
+#  server.py route handlers need zero edits.
+#
+#  Key scheme: elite:{domain}:{player_id}  (sets for memberships, hashes for maps).
 # -----------------------------------------------------------------------------
-_lock = threading.Lock()
-_chapter_state = {}     # pid -> {"current_chapter_id": str, "progress": int, "completed": set}
-_estate_funded = {}     # pid -> set(task_id)
-_estate_room_paid = {}  # pid -> set(room_id)  (rooms whose completion reward was paid)
-_album_disc = {}        # pid -> set(value)
-_events_state = {}      # pid -> {event_id -> {"progress": int, "claimed": set(threshold)}}
-_mock_wallet = {}       # pid -> {"gold": int, "gems": int}
+import os
 
 
-def _wallet(pid):
-    return _mock_wallet.setdefault(pid, {"gold": DEFAULT_GOLD, "gems": DEFAULT_GEMS})
+class EliteStore:
+    def __init__(self):
+        self._r = None
+        self._mem = {}                 # key -> set | dict (mirrors Redis value types)
+        self._lock = threading.Lock()  # fallback-only synchronization
+        url = os.environ.get("REDIS_URL", "").strip() or os.environ.get("REDIS", "").strip()
+        if url:
+            try:
+                import redis as _redis
+                self._r = _redis.from_url(url, decode_responses=True, socket_connect_timeout=3)
+                self._r.ping()
+            except Exception as _e:
+                print("[elite] Redis unavailable (%s) -- using in-memory fallback" % _e)
+                self._r = None
+        self.backend = "redis" if self._r is not None else "memory"
+        print("[elite] EliteStore backend = %s" % self.backend)
+
+    # ---- set ops (string members) ----
+    def sadd(self, key, member):
+        m = str(member)
+        if self._r is not None:
+            self._r.sadd(key, m)
+        else:
+            with self._lock:
+                self._mem.setdefault(key, set()).add(m)
+
+    def smembers(self, key):
+        if self._r is not None:
+            return set(self._r.smembers(key))
+        with self._lock:
+            return set(self._mem.get(key, set()))
+
+    def sismember(self, key, member):
+        m = str(member)
+        if self._r is not None:
+            return bool(self._r.sismember(key, m))
+        with self._lock:
+            return m in self._mem.get(key, set())
+
+    # ---- hash ops (string fields/values) ----
+    def hget(self, key, field, default=None):
+        if self._r is not None:
+            v = self._r.hget(key, field)
+            return v if v is not None else default
+        with self._lock:
+            return self._mem.get(key, {}).get(field, default)
+
+    def hset(self, key, field, value):
+        if self._r is not None:
+            self._r.hset(key, field, str(value))
+        else:
+            with self._lock:
+                self._mem.setdefault(key, {})[field] = str(value)
+
+    def hincrby(self, key, field, amount):
+        if self._r is not None:
+            return int(self._r.hincrby(key, field, int(amount)))
+        with self._lock:
+            d = self._mem.setdefault(key, {})
+            d[field] = str(int(d.get(field, "0")) + int(amount))
+            return int(d[field])
+
+
+STORE = EliteStore()
+
+
+# ---------------------------------------------------------------------------
+#  Mock wallet (isolated from the real economy DB; swap for the players table).
+# ---------------------------------------------------------------------------
+def _wkey(pid):
+    return "elite:wallet:%s" % pid
+
+
+def _wallet_init(pid):
+    key = _wkey(pid)
+    if STORE.hget(key, "gold") is None:
+        STORE.hset(key, "gold", DEFAULT_GOLD)
+        STORE.hset(key, "gems", DEFAULT_GEMS)
+    return key
+
+
+def _wallet_get(pid):
+    key = _wallet_init(pid)
+    return {"gold": int(STORE.hget(key, "gold", DEFAULT_GOLD)),
+            "gems": int(STORE.hget(key, "gems", DEFAULT_GEMS))}
+
+
+def _wallet_add_gems(pid, n):
+    if int(n) != 0:
+        STORE.hincrby(_wallet_init(pid), "gems", int(n))
+
+
+def _wallet_spend_gold(pid, n):
+    key = _wallet_init(pid)
+    if int(STORE.hget(key, "gold", 0)) < int(n):
+        return False
+    STORE.hincrby(key, "gold", -int(n))
+    return True
+
+
+def _wallet_spend_gems(pid, n):
+    key = _wallet_init(pid)
+    if int(STORE.hget(key, "gems", 0)) < int(n):
+        return False
+    STORE.hincrby(key, "gems", -int(n))
+    return True
 
 
 def wallet_snapshot(pid):
-    w = _wallet(pid)
-    return {"gold": w["gold"], "gems": w["gems"]}
+    return _wallet_get(pid)
 
 
-# ---------------------------------------------------------------------------
-#  /meta/catalog
-# ---------------------------------------------------------------------------
 def meta_catalog():
     return {
         "content_version": CONTENT_VERSION,
@@ -142,34 +243,45 @@ def _chapters():
 
 
 def chapter_state(pid):
-    with _lock:
-        first = _chapters()[0]["id"] if _chapters() else ""
-        st = _chapter_state.setdefault(pid, {"current_chapter_id": first, "progress": 0, "completed": set()})
-        return {"current_chapter_id": st["current_chapter_id"], "progress": st["progress"]}
+    key = "elite:chapter:%s" % pid
+    cur = STORE.hget(key, "current_chapter_id")
+    if cur is None:
+        cur = _chapters()[0]["id"] if _chapters() else ""
+        STORE.hset(key, "current_chapter_id", cur)
+        STORE.hset(key, "progress", 0)
+    return {"current_chapter_id": cur, "progress": int(STORE.hget(key, "progress", 0))}
 
 
 def complete_chapter(pid, chapter_id):
-    with _lock:
-        chapters = _chapters()
-        first = chapters[0]["id"] if chapters else ""
-        st = _chapter_state.setdefault(pid, {"current_chapter_id": first, "progress": 0, "completed": set()})
-        ch = next((c for c in chapters if c["id"] == chapter_id), None)
-        if ch is None or chapter_id in st["completed"]:
-            return {"status": "noop"}
-        st["completed"].add(chapter_id)
-        reward = ch.get("reward", {})
-        _wallet(pid)["gems"] += int(reward.get("gems", 0))
-        nxt = ""
-        for c in chapters:
-            if c["id"] not in st["completed"]:
-                nxt = c["id"]
-                break
-        st["current_chapter_id"] = nxt or chapter_id
-        st["progress"] = 0
-        out = {"status": "success", "chapter_id": chapter_id, "reward": reward}
-        if nxt:
-            out["next_chapter_id"] = nxt
-        return out
+    chapters = _chapters()
+    first = chapters[0]["id"] if chapters else ""
+    ckey = "elite:chapter:%s" % pid
+    dkey = "elite:chapter_done:%s" % pid
+    if STORE.hget(ckey, "current_chapter_id") is None:
+        STORE.hset(ckey, "current_chapter_id", first)
+        STORE.hset(ckey, "progress", 0)
+    ch = next((c for c in chapters if c["id"] == chapter_id), None)
+    if ch is None or STORE.sismember(dkey, chapter_id):
+        return {"status": "noop"}
+    # Anti-exploit: only the CURRENT chapter, and only once its goal target is met.
+    if chapter_id != STORE.hget(ckey, "current_chapter_id"):
+        return {"status": "error", "message": "not current chapter"}
+    if int(STORE.hget(ckey, "progress", 0)) < int(ch.get("target", 0)):
+        return {"status": "error", "message": "not reached"}
+    STORE.sadd(dkey, chapter_id)
+    reward = ch.get("reward", {})
+    _wallet_add_gems(pid, int(reward.get("gems", 0)))
+    nxt = ""
+    for c in chapters:
+        if not STORE.sismember(dkey, c["id"]):
+            nxt = c["id"]
+            break
+    STORE.hset(ckey, "current_chapter_id", nxt or chapter_id)
+    STORE.hset(ckey, "progress", 0)
+    out = {"status": "success", "chapter_id": chapter_id, "reward": reward}
+    if nxt:
+        out["next_chapter_id"] = nxt
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -192,143 +304,231 @@ def _task_cost(task_id):
 
 
 def _maybe_pay_room(pid, room):
-    funded = _estate_funded.setdefault(pid, set())
-    paid = _estate_room_paid.setdefault(pid, set())
+    fkey = "elite:estate_funded:%s" % pid
+    pkey = "elite:estate_paid:%s" % pid
+    funded = STORE.smembers(fkey)
     rid = room["id"]
-    if rid not in paid and all(t["id"] in funded for t in room["tasks"]):
-        paid.add(rid)
-        _wallet(pid)["gems"] += int(room.get("reward", {}).get("gems", 0))
+    if not STORE.sismember(pkey, rid) and all(t["id"] in funded for t in room["tasks"]):
+        STORE.sadd(pkey, rid)
+        _wallet_add_gems(pid, int(room.get("reward", {}).get("gems", 0)))
 
 
 def estate_state(pid):
-    with _lock:
-        funded = _estate_funded.setdefault(pid, set())
-        cur = ""
-        for r in CATALOGS["estate_rooms"]:
-            if not all(t["id"] in funded for t in r["tasks"]):
-                cur = r["id"]
-                break
-        if not cur and CATALOGS["estate_rooms"]:
-            cur = CATALOGS["estate_rooms"][-1]["id"]
-        return {"current_room_id": cur, "funded_tasks": sorted(funded)}
+    funded = STORE.smembers("elite:estate_funded:%s" % pid)
+    cur = ""
+    for r in CATALOGS["estate_rooms"]:
+        if not all(t["id"] in funded for t in r["tasks"]):
+            cur = r["id"]
+            break
+    if not cur and CATALOGS["estate_rooms"]:
+        cur = CATALOGS["estate_rooms"][-1]["id"]
+    return {"current_room_id": cur, "funded_tasks": sorted(funded)}
 
 
 def fund_task(pid, task_id, _client_cost):
-    with _lock:
-        cost = _task_cost(task_id)   # AUTHORITATIVE -- ignore the client's cost
-        if cost is None:
-            return {"status": "error", "message": "Unknown task"}
-        funded = _estate_funded.setdefault(pid, set())
-        w = _wallet(pid)
-        if task_id not in funded:
-            if w["gold"] < cost:
-                return {"status": "error", "message": "Insufficient funds"}
-            w["gold"] -= cost
-            funded.add(task_id)
-            room = _room_of_task(task_id)
-            if room:
-                _maybe_pay_room(pid, room)
-        return {"status": "success", "task_id": task_id, "funded_tasks": sorted(funded), "new_balance": w["gold"]}
+    cost = _task_cost(task_id)
+    if cost is None:
+        return {"status": "error", "message": "Unknown task"}
+    fkey = "elite:estate_funded:%s" % pid
+    if not STORE.sismember(fkey, task_id):
+        if not _wallet_spend_gold(pid, cost):
+            return {"status": "error", "message": "Insufficient funds"}
+        STORE.sadd(fkey, task_id)
+        room = _room_of_task(task_id)
+        if room:
+            _maybe_pay_room(pid, room)
+    return {"status": "success", "task_id": task_id,
+            "funded_tasks": sorted(STORE.smembers(fkey)),
+            "new_balance": _wallet_get(pid)["gold"]}
 
 
 def finish_room(pid, room_id):
-    with _lock:
-        room = next((r for r in CATALOGS["estate_rooms"] if r["id"] == room_id), None)
-        if room is None:
-            return {"status": "error", "message": "Unknown room"}
-        funded = _estate_funded.setdefault(pid, set())
-        remaining = [t for t in room["tasks"] if t["id"] not in funded]
-        gem_price = len(remaining) * 25   # AUTHORITATIVE price (matches client estimate)
-        w = _wallet(pid)
-        if gem_price > 0:
-            if w["gems"] < gem_price:
-                return {"status": "error", "message": "Insufficient gems"}
-            w["gems"] -= gem_price
-            for t in remaining:
-                funded.add(t["id"])
-            _maybe_pay_room(pid, room)
-        return {"status": "success", "funded_tasks": sorted(funded), "new_balance": w["gold"]}
+    room = next((r for r in CATALOGS["estate_rooms"] if r["id"] == room_id), None)
+    if room is None:
+        return {"status": "error", "message": "Unknown room"}
+    fkey = "elite:estate_funded:%s" % pid
+    funded = STORE.smembers(fkey)
+    remaining = [t for t in room["tasks"] if t["id"] not in funded]
+    gem_price = len(remaining) * 25
+    if gem_price > 0:
+        if not _wallet_spend_gems(pid, gem_price):
+            return {"status": "error", "message": "Insufficient gems"}
+        for t in remaining:
+            STORE.sadd(fkey, t["id"])
+        _maybe_pay_room(pid, room)
+    return {"status": "success",
+            "funded_tasks": sorted(STORE.smembers(fkey)),
+            "new_balance": _wallet_get(pid)["gold"]}
 
 
 # ---------------------------------------------------------------------------
 #  Collection Album
 # ---------------------------------------------------------------------------
 def album_state(pid):
-    with _lock:
-        return {"discovered": sorted(_album_disc.setdefault(pid, set()))}
+    return {"discovered": sorted(int(v) for v in STORE.smembers("elite:album:%s" % pid))}
 
 
 def claim_discovery(pid, value):
-    with _lock:
-        card = next((c for c in CATALOGS["album"] if int(c["value"]) == int(value)), None)
-        if card is None:
-            return {"status": "error", "message": "Unknown value"}
-        disc = _album_disc.setdefault(pid, set())
-        if value in disc:
-            return {"status": "success", "value": value, "reward": {}}   # idempotent
-        disc.add(value)
-        reward = card.get("reward", {})
-        _wallet(pid)["gems"] += int(reward.get("gems", 0))
-        return {"status": "success", "value": value, "reward": reward}
+    card = next((c for c in CATALOGS["album"] if int(c["value"]) == int(value)), None)
+    if card is None:
+        return {"status": "error", "message": "Unknown value"}
+    akey = "elite:album:%s" % pid
+    if STORE.sismember(akey, value):
+        return {"status": "success", "value": value, "reward": {}}
+    STORE.sadd(akey, value)
+    reward = card.get("reward", {})
+    _wallet_add_gems(pid, int(reward.get("gems", 0)))
+    return {"status": "success", "value": value, "reward": reward}
 
 
 # ---------------------------------------------------------------------------
 #  Live-Ops Event Calendar
 # ---------------------------------------------------------------------------
-def _player_events(pid):
-    st = _events_state.setdefault(pid, {})
-    for ev in CATALOGS["events"]:
-        st.setdefault(ev["id"], {"progress": int(ev.get("progress", 0)), "claimed": set()})
-    return st
-
-
 def active_events(pid):
-    with _lock:
-        st = _player_events(pid)
-        now = int(time.time())
-        out = []
-        for ev in CATALOGS["events"]:
-            ends = int(ev.get("ends_at", 0))
-            if ends != 0 and ends <= now:
-                continue
-            pst = st[ev["id"]]
-            milestones = []
-            for m in ev["milestones"]:
-                milestones.append({
-                    "threshold": m["threshold"],
-                    "reward": m["reward"],
-                    "claimed": m["threshold"] in pst["claimed"],
-                })
-            entry = {k: v for k, v in ev.items() if k != "milestones"}
-            entry["progress"] = pst["progress"]
-            entry["milestones"] = milestones
-            out.append(entry)
-        return {"events": out}
+    now = int(time.time())
+    pkey = "elite:event_prog:%s" % pid
+    out = []
+    for ev in CATALOGS["events"]:
+        ends = int(ev.get("ends_at", 0))
+        if ends != 0 and ends <= now:
+            continue
+        prog = int(STORE.hget(pkey, ev["id"], int(ev.get("progress", 0))))
+        claimed = STORE.smembers("elite:event_claimed:%s:%s" % (pid, ev["id"]))
+        milestones = [{"threshold": m["threshold"], "reward": m["reward"],
+                       "claimed": str(m["threshold"]) in claimed} for m in ev["milestones"]]
+        entry = {k: v for k, v in ev.items() if k != "milestones"}
+        entry["progress"] = prog
+        entry["milestones"] = milestones
+        out.append(entry)
+    return {"events": out}
 
 
 def claim_milestone(pid, event_id, threshold):
-    with _lock:
-        ev = next((e for e in CATALOGS["events"] if e["id"] == event_id), None)
-        if ev is None:
-            return {"status": "error", "message": "Unknown event"}
-        st = _player_events(pid)
-        pst = st[event_id]
-        m = next((mm for mm in ev["milestones"] if int(mm["threshold"]) == int(threshold)), None)
-        if m is None:
-            return {"status": "error", "message": "Unknown milestone"}
-        if threshold in pst["claimed"]:
-            return {"status": "noop"}
-        # Mock accepts the claim. Real server: require pst["progress"] >= threshold.
-        pst["claimed"].add(threshold)
-        reward = m.get("reward", {})
-        if isinstance(reward, dict) and int(reward.get("gems", 0)) > 0:
-            _wallet(pid)["gems"] += int(reward["gems"])
-        return {"status": "success", "event_id": event_id, "threshold": threshold, "reward": reward}
+    ev = next((e for e in CATALOGS["events"] if e["id"] == event_id), None)
+    if ev is None:
+        return {"status": "error", "message": "Unknown event"}
+    m = next((mm for mm in ev["milestones"] if int(mm["threshold"]) == int(threshold)), None)
+    if m is None:
+        return {"status": "error", "message": "Unknown milestone"}
+    ckey = "elite:event_claimed:%s:%s" % (pid, event_id)
+    if STORE.sismember(ckey, threshold):
+        return {"status": "noop"}
+    # Anti-exploit: the server must have accrued progress >= threshold for this event.
+    prog = int(STORE.hget("elite:event_prog:%s" % pid, event_id, int(ev.get("progress", 0))))
+    if prog < int(threshold):
+        return {"status": "error", "message": "not reached"}
+    STORE.sadd(ckey, threshold)
+    reward = m.get("reward", {})
+    if isinstance(reward, dict) and int(reward.get("gems", 0)) > 0:
+        _wallet_add_gems(pid, int(reward["gems"]))
+    return {"status": "success", "event_id": event_id, "threshold": threshold, "reward": reward}
+
+
+# Maps /stats/submit_run payload field names -> meta goal_ids.
+_RUN_FIELD_MAP = {
+    "cashouts":             "run_cashouts",
+    "run_merges":           "run_merges",
+    "run_combo_count":      "run_combo_count",
+    "cursed_removed":       "run_cursed_removed",
+    "best_cashout_run":     "run_best_single_cashout",
+    "weekly_cashout_total": "session_cashout_total",
+}
+# Monotonic 'best' goals accumulate with max(); the rest are counters (+=).
+_MAX_GOALS = {"run_best_single_cashout", "session_cashout_total"}
+
+
+def accrue_run(player_id, stats):
+    # Normalize the submit_run payload to goal_id -> int value.
+    goals = {}
+    for src, goal in _RUN_FIELD_MAP.items():
+        if src in stats:
+            try:
+                goals[goal] = int(stats[src])
+            except (TypeError, ValueError):
+                pass
+    if not goals:
+        return
+    # Advance every active event whose progress_goal_id matches a reported stat.
+    pkey = "elite:event_prog:%s" % player_id
+    for ev in CATALOGS["events"]:
+        gid = ev.get("progress_goal_id", "")
+        if gid in goals:
+            cur = int(STORE.hget(pkey, ev["id"], int(ev.get("progress", 0))))
+            val = goals[gid]
+            STORE.hset(pkey, ev["id"], max(cur, val) if gid in _MAX_GOALS else cur + val)
+    # Advance the CURRENT chapter's progress.
+    ckey = "elite:chapter:%s" % player_id
+    cur_id = STORE.hget(ckey, "current_chapter_id")
+    if cur_id is None:
+        cur_id = _chapters()[0]["id"] if _chapters() else ""
+        STORE.hset(ckey, "current_chapter_id", cur_id)
+        STORE.hset(ckey, "progress", 0)
+    ch = next((c for c in _chapters() if c["id"] == cur_id), None)
+    if ch:
+        gid = ch.get("goal_id", "")
+        if gid in goals:
+            cur = int(STORE.hget(ckey, "progress", 0))
+            val = goals[gid]
+            STORE.hset(ckey, "progress", max(cur, val) if gid in _MAX_GOALS else cur + val)
 
 
 # ---------------------------------------------------------------------------
-#  Monetization -- offer segment
+#  Monetization -- offer segment (real, spend + lifecycle based)
 # ---------------------------------------------------------------------------
-def offer_segment(_pid):
-    # MOCK: real server computes from spend history / lifecycle. Default is valid.
-    return "default"
+import datetime as _dt
+
+
+def _days_since(iso_str, now):
+    if not iso_str:
+        return None
+    try:
+        d = _dt.datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if d.tzinfo is not None:
+            d = d.replace(tzinfo=None)
+        return (now - d).total_seconds() / 86400.0
+    except Exception:
+        return None
+
+
+def offer_segment(player_id, cursor=None):
+    # Bucket from lifetime IAP spend + lifecycle. 'default' on any missing data
+    # or error, so the store always renders a valid offer. Fully crash-safe.
+    try:
+        own = None
+        cur = cursor
+        if cur is None:
+            import server as _srv
+            own = _srv.get_connection()
+            cur = own.cursor()
+        try:
+            cur.execute("SELECT COALESCE(SUM(usd_amount), 0) FROM iap_receipts WHERE player_id = ?", (player_id,))
+            srow = cur.fetchone()
+            lifetime = float(srow[0]) if srow and srow[0] is not None else 0.0
+            cur.execute("SELECT install_date, last_session_time FROM players WHERE player_id = ?", (player_id,))
+            prow = cur.fetchone()
+        finally:
+            if own is not None:
+                own.close()
+
+        if lifetime >= 100.0:
+            return "whale"
+        if lifetime >= 20.0:
+            return "dolphin"
+        if lifetime > 0.0:
+            return "minnow"
+
+        # Never spent -> lifecycle bucket.
+        if prow is None:
+            return "default"
+        now = _dt.datetime.utcnow()
+        days_install = _days_since(prow[0], now)
+        if days_install is None:
+            return "default"
+        if days_install < 3.0:
+            return "new"
+        days_active = _days_since(prow[1] if len(prow) > 1 else None, now)
+        if days_active is None or days_active >= 7.0:
+            return "lapsing"
+        return "minnow"
+    except Exception:
+        return "default"

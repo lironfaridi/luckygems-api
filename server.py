@@ -4104,6 +4104,21 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     finally:
         conn.close()
 
+    # Elite meta accrual: advance event + chapter progress from the CLAMPED
+    # (anti-cheat) run stats into the durable EliteStore. Pure Redis -- no DB
+    # dependency. Wrapped so a meta hiccup can never break run submission.
+    try:
+        _elite.accrue_run(player_id, {
+            "cashouts":             cashouts,
+            "run_merges":           run_merges,
+            "run_combo_count":      run_combo_count,
+            "cursed_removed":       cursed_removed,
+            "best_cashout_run":     best_cashout_run,
+            "weekly_cashout_total": int(payload.get("weekly_cashout_total", 0)),
+        })
+    except Exception as _acc_err:
+        print(f"[submit_run] elite accrue_run skipped: {_acc_err}")
+
     resp = {
         "status": "success",
         "stats": {
@@ -7476,6 +7491,43 @@ async def elite_claim_milestone(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     return _elite.claim_milestone(player_id, str(body.get("event_id", "")), int(body.get("threshold", 0)))
+
+
+# ============================================================================
+#  COMPAT STUBS (full-stack 404 sweep): client endpoints that had NO server route.
+#  Safe JWT-only stubs returning the EXACT shapes the client dispatch expects, so
+#  they stop 404ing. These are STUBS (empty/zero) -- replace with real impls
+#  (leaderboard ranking, new-player bonus, legacy event shards). The client sends
+#  NO X-Signature on these, so they use extract_player_id only (no HMAC verify).
+# ============================================================================
+@app.get("/leaderboard/weekly")
+def compat_leaderboard_weekly(request: Request):
+    extract_player_id(request)
+    return {"status": "ok", "leaderboard": []}
+
+
+@app.post("/leaderboard/claim")
+async def compat_leaderboard_claim(request: Request):
+    extract_player_id(request)
+    return {"status": "ok", "gems_awarded": 0}
+
+
+@app.get("/leaderboard/rival")
+def compat_leaderboard_rival(request: Request):
+    extract_player_id(request)
+    return {"status": "ok"}
+
+
+@app.post("/events/claim_shards")
+async def compat_claim_event_shards(request: Request):
+    extract_player_id(request)
+    return {"status": "ok", "gold_awarded": 0, "shards_remaining": 0}
+
+
+@app.post("/player/claim_new_player_gem_bonus")
+async def compat_claim_new_player_gem_bonus(request: Request):
+    extract_player_id(request)
+    return {"status": "ok", "gems_awarded": 0}
 
 
 if __name__ == "__main__":
