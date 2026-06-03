@@ -2019,6 +2019,7 @@ async def get_config_flags(request: Request):
     finally:
         conn.close()
 
+    result_flags["offer_segment"] = _elite.offer_segment(player_id)  # Sprint 7 monetization
     return {"status": "ok", "flags": result_flags}
 
 
@@ -6757,6 +6758,55 @@ async def iap_catalog(request: Request):
     }
 
 
+# ----------------------------------------------------------------------------
+#  Piggy->IAP bridge (Sprint 7): the piggy_instant_199 CONSUMABLE performs a
+#  FULL piggy smash (cash-paid) instead of crediting gems. Reuses the same DB
+#  economy as /piggy/smash (gems tier) -- minus the gem cost and minus the
+#  daily-smash gate (it's a paid bypass, surfaced only when the piggy is full
+#  AND the free daily smashes are exhausted). Standard gem purchases are
+#  completely unaffected.
+# ----------------------------------------------------------------------------
+_PIGGY_INSTANT_PRODUCT = "piggy_instant_199"
+_PIGGY_INSTANT_USD     = 1.99
+
+
+def _execute_piggy_instant_smash(player_id: str, cursor) -> dict:
+    cursor.execute(
+        "SELECT piggy_balance, mastery_state FROM players WHERE player_id = ?",
+        (player_id,)
+    )
+    row   = cursor.fetchone()
+    piggy = int(row[0]) if row and row[0] is not None else 0
+    _ms   = _safe_parse_mastery(row[1] if row else "{}")
+    _cashout_multiplier = 1.0 + int(_ms.get("econ_cashout_bonus", 0)) * 0.05
+    reward = int(piggy * _cashout_multiplier)   # full smash (same tier as the gems-paid smash)
+    cursor.execute(
+        """UPDATE players SET
+               total_money          = total_money + ?,
+               piggy_balance        = 0,
+               total_piggy_smashes  = COALESCE(total_piggy_smashes, 0) + 1,
+               total_piggy_earnings = COALESCE(total_piggy_earnings, 0) + ?
+           WHERE player_id = ?""",
+        (reward, reward, player_id)
+    )
+    cursor.execute(
+        "SELECT total_money, gems_balance FROM players WHERE player_id = ?",
+        (player_id,)
+    )
+    upd = cursor.fetchone()
+    _invalidate_balance_cache(player_id)
+    # gems_credited:0 keeps the client's gem-purchase dispatch happy (status 'ok').
+    return {
+        "gems_credited":  0,
+        "bonus_gems":     0,
+        "piggy_smash":    True,
+        "reward_amount":  reward,
+        "wallet_balance": int(upd[0]) if upd else 0,
+        "gems_balance":   int(upd[1]) if upd else 0,
+        "piggy_balance":  0,
+    }
+
+
 @app.post("/iap/validate/google")
 async def iap_validate_google(request: Request):
     """
@@ -6778,7 +6828,7 @@ async def iap_validate_google(request: Request):
 
     if not purchase_token:
         raise HTTPException(status_code=400, detail="purchase_token is required")
-    if product_id not in _GEM_BUNDLES_BY_ID:
+    if product_id not in _GEM_BUNDLES_BY_ID and product_id != _PIGGY_INSTANT_PRODUCT:
         raise HTTPException(status_code=400, detail=f"Unknown product_id: {product_id}")
 
     app_env = os.environ.get("APP_ENV", "development").lower()
@@ -6817,14 +6867,18 @@ async def iap_validate_google(request: Request):
 
     get_or_create_player(player_id, cursor)
 
-    try:
-        credit_result = _credit_gem_bundle(player_id, product_id, cursor)
-    except ValueError as _ve:
-        conn.close()
-        raise HTTPException(status_code=400, detail=str(_ve))
-
-    bundle    = _GEM_BUNDLES_BY_ID[product_id]
-    price_usd = float(bundle["usd"])
+    if product_id == _PIGGY_INSTANT_PRODUCT:
+        # Cash-paid full piggy smash instead of gem crediting.
+        credit_result = _execute_piggy_instant_smash(player_id, cursor)
+        price_usd     = _PIGGY_INSTANT_USD
+    else:
+        try:
+            credit_result = _credit_gem_bundle(player_id, product_id, cursor)
+        except ValueError as _ve:
+            conn.close()
+            raise HTTPException(status_code=400, detail=str(_ve))
+        bundle    = _GEM_BUNDLES_BY_ID[product_id]
+        price_usd = float(bundle["usd"])
 
     cursor.execute(
         """INSERT INTO iap_receipts
@@ -6860,7 +6914,7 @@ async def iap_validate_apple(request: Request):
 
     if not transaction_id:
         raise HTTPException(status_code=400, detail="transaction_id is required")
-    if product_id not in _GEM_BUNDLES_BY_ID:
+    if product_id not in _GEM_BUNDLES_BY_ID and product_id != _PIGGY_INSTANT_PRODUCT:
         raise HTTPException(status_code=400, detail=f"Unknown product_id: {product_id}")
 
     app_env = os.environ.get("APP_ENV", "development").lower()
@@ -6890,14 +6944,18 @@ async def iap_validate_apple(request: Request):
 
     get_or_create_player(player_id, cursor)
 
-    try:
-        credit_result = _credit_gem_bundle(player_id, product_id, cursor)
-    except ValueError as _ve:
-        conn.close()
-        raise HTTPException(status_code=400, detail=str(_ve))
-
-    bundle    = _GEM_BUNDLES_BY_ID[product_id]
-    price_usd = float(bundle["usd"])
+    if product_id == _PIGGY_INSTANT_PRODUCT:
+        # Cash-paid full piggy smash instead of gem crediting.
+        credit_result = _execute_piggy_instant_smash(player_id, cursor)
+        price_usd     = _PIGGY_INSTANT_USD
+    else:
+        try:
+            credit_result = _credit_gem_bundle(player_id, product_id, cursor)
+        except ValueError as _ve:
+            conn.close()
+            raise HTTPException(status_code=400, detail=str(_ve))
+        bundle    = _GEM_BUNDLES_BY_ID[product_id]
+        price_usd = float(bundle["usd"])
 
     cursor.execute(
         """INSERT INTO iap_receipts
@@ -7325,6 +7383,100 @@ async def clear_run_state(request: Request):
         conn.close()
 
     return {"status": "success"}
+
+
+# ============================================================================
+#  ELITE ADAPTATION ENDPOINTS (Sprints 1-7)
+#  Appended block. Reuses the EXISTING security path (extract_auth /
+#  extract_player_id / _verify_financial_signature) -- no parallel auth system.
+#  Content + per-player state live in elite_content.py (in-memory MOCK; swap the
+#  helpers for DB queries later). JSON shapes match docs/SERVER_CONTRACT_*.md.
+#  GET routes require a valid JWT; mutating routes are HMAC-signed exactly like
+#  /bank/deposit and /shop/buy_boost.
+# ============================================================================
+import elite_content as _elite
+
+
+@app.get("/meta/catalog")
+def elite_meta_catalog(request: Request):
+    extract_player_id(request)            # require a valid Bearer JWT
+    return _elite.meta_catalog()
+
+
+@app.get("/meta/chapter_state")
+def elite_chapter_state(request: Request):
+    return _elite.chapter_state(extract_player_id(request))
+
+
+@app.post("/meta/complete_chapter")
+async def elite_complete_chapter(request: Request):
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return _elite.complete_chapter(player_id, str(body.get("chapter_id", "")))
+
+
+@app.get("/estate/state")
+def elite_estate_state(request: Request):
+    return _elite.estate_state(extract_player_id(request))
+
+
+@app.post("/estate/fund_task")
+async def elite_fund_task(request: Request):
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return _elite.fund_task(player_id, str(body.get("task_id", "")), int(body.get("cost", 0)))
+
+
+@app.post("/estate/finish_room")
+async def elite_finish_room(request: Request):
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return _elite.finish_room(player_id, str(body.get("room_id", "")))
+
+
+@app.get("/album/state")
+def elite_album_state(request: Request):
+    return _elite.album_state(extract_player_id(request))
+
+
+@app.post("/album/claim_discovery")
+async def elite_claim_discovery(request: Request):
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return _elite.claim_discovery(player_id, int(body.get("value", 0)))
+
+
+@app.get("/events/active")
+def elite_events_active(request: Request):
+    return _elite.active_events(extract_player_id(request))
+
+
+@app.post("/events/claim_milestone")
+async def elite_claim_milestone(request: Request):
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return _elite.claim_milestone(player_id, str(body.get("event_id", "")), int(body.get("threshold", 0)))
+
 
 if __name__ == "__main__":
     import uvicorn
