@@ -5,3 +5,4 @@ PyJWT
 httpx[http2]
 firebase-admin
 redis
+sentry-sdk    # optional: only used when SENTRY_DSN env is set (import is guarded)
