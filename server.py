@@ -1618,9 +1618,10 @@ WHEEL_PRIZES = [
     {"id": "boost_cashout_2x", "name": "2x Cashout Boost",      "gold": 0,    "gems": 0,   "modifier": "boost_cashout_2x","pending_mod": None,            "rarity": "epic"},      # 10 NEW
     {"id": "gold_5000",        "name": "5,000 Gold",            "gold": 5000, "gems": 0,   "modifier": None,             "pending_mod": None,             "rarity": "uncommon"},  # 11 NEW
 ]
-# Total weight = 108.  Jackpot (index 4) = 1/108 ~ 0.93%.
+# Total weight = 100 (clean per-%% read). Jackpot (idx 4) = 1/100 = 1.00%%.
+# Rarity mix: common 48%% / uncommon 36%% / rare 7%% / epic 8%% / jackpot 1%%.
 # Two common slots (1, 7) reduced from 25 to 22 to accommodate the two new prizes.
-WHEEL_WEIGHTS = [10, 22, 7, 13, 1, 4, 3, 22, 6, 9, 4, 7]
+WHEEL_WEIGHTS = [9, 20, 7, 12, 1, 3, 2, 20, 6, 8, 3, 9]
 
 # After PITY_THRESHOLD consecutive common-rarity outcomes the next spin is drawn
 # exclusively from the non-common pool (uncommon / rare / epic / jackpot).
