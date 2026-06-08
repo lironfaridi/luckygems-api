@@ -3303,7 +3303,8 @@ def get_player_stats(request: Request):
                lifetime_cash_earned, total_merges, best_survival_time,
                best_cashouts_run, best_combo, cursed_tiles_removed, total_runs,
                gems_balance, total_piggy_smashes, best_single_cashout,
-               total_piggy_earnings
+               total_piggy_earnings,
+               COALESCE(max_tier_reached, 0)
         FROM players
         WHERE player_id = ?
     """, (player_id,))
@@ -3343,11 +3344,17 @@ def get_player_stats(request: Request):
         "records": {
             "lifetime_cash_earned": int(row[3]),
             "total_merges":         int(row[4]),
+            # row[5] = best_survival_time, row[6] = best_cashouts_run (were in SELECT but
+            # silently omitted from the response -- the stats screen showed 0 for these).
+            "best_survival_time":   int(row[5]) if row[5] is not None else 0,
+            "best_cashouts_run":    int(row[6]) if row[6] is not None else 0,
             "best_combo":           int(row[7]),
             "cursed_tiles_removed": int(row[8]),
             "total_piggy_smashes":  int(row[11]) if row[11] is not None else 0,
             "best_single_cashout":  int(row[12]) if row[12] is not None else 0,
             "total_piggy_earnings": int(row[13]) if row[13] is not None else 0,
+            # row[14] = max_tier_reached (highest gem tier ever produced by a merge).
+            "max_tier_reached":     int(row[14]) if row[14] is not None else 0,
         },
         "achievements": all_achievements,
         "gems_balance": int(row[10]) if row[10] is not None else 0,
@@ -4006,15 +4013,18 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     # Additional run-level payload fields (clamped for anti-cheat).
     _MAX_HIGH_TIER_MERGES = 500
     _MAX_SINGLE_CASHOUT   = _MAX_CASH_PER_RUN
-    high_tier_merges_run = min(max(0, int(payload.get("high_tier_merges", 0))), _MAX_HIGH_TIER_MERGES)
+    high_tier_merges_run = min(max(0, int(payload.get("high_tier_merges",  0))), _MAX_HIGH_TIER_MERGES)
     best_cashout_run     = min(max(0, int(payload.get("best_cashout_run",  0))), _MAX_SINGLE_CASHOUT)
+    # Highest gem tier actually produced by a merge this run (client tracks as _run_max_tier_merged).
+    max_tier_merged_run  = min(max(0, int(payload.get("max_tier_merged",   0))), 11)
     is_new_pb_cashout    = False
 
     cursor.execute("""
         SELECT lifetime_cash_earned, best_survival_time, best_cashouts_run,
                best_combo, cursed_tiles_removed, total_runs, total_merges,
                high_tier_merges, best_session_merges, best_single_cashout,
-               peak_wallet_balance, total_money, board_stage
+               peak_wallet_balance, total_money, board_stage,
+               COALESCE(max_tier_reached, 0)
         FROM players
         WHERE player_id = ?
     """, (player_id,))
@@ -4041,6 +4051,13 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     new_total_money      = int(row[11] or 0) + cash_earned
     peak_wallet_balance  = max(int(row[10] or 0), new_total_money)
     board_stage_for_quest = int(row[12]) if row[12] is not None else 0
+    max_tier_reached_new  = max(int(row[13] or 0), max_tier_merged_run)
+
+    # max_tier_reached column: ADD IF MISSING (safe no-op when already present).
+    try:
+        cursor.execute("ALTER TABLE players ADD COLUMN max_tier_reached INTEGER DEFAULT 0")
+    except Exception:
+        pass  # column already exists
 
     cursor.execute("""
         UPDATE players
@@ -4055,6 +4072,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
             best_session_merges = ?,
             best_single_cashout = ?,
             peak_wallet_balance = ?,
+            max_tier_reached = ?,
             is_rescue_active = 0
         WHERE player_id = ?
     """, (
@@ -4069,6 +4087,7 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
         best_session_merges,
         best_single_cashout,
         peak_wallet_balance,
+        max_tier_reached_new,
         player_id
     ))
 
