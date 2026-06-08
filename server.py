@@ -155,21 +155,55 @@ _GOOGLE_PLAY_PACKAGE: str = os.getenv("GOOGLE_PLAY_PACKAGE",
                                        "com.faridistudio.luckygems").strip()
 
 _USE_POSTGRES: bool = DATABASE_URL.startswith(("postgresql", "postgres"))
+_APP_ENV_BOOT: str = os.environ.get("APP_ENV", "development").strip().lower()
 
 # -- PostgreSQL connection pool (psycopg2) -----------------------------------
+# Render cold-starts and Supabase's connection pooler can both refuse the very
+# first connection attempt for a few seconds after boot. A bare try/except here
+# would permanently downgrade this worker to ephemeral local SQLite for its
+# entire lifetime -- on Render that file is wiped on every restart/redeploy,
+# which is exactly the "Groundhog Day" progress-loss symptom. Retry with
+# backoff before giving up, and in production never fall back silently: a
+# silently-degraded worker writing to a doomed local file is worse than a
+# worker that fails to boot.
 _PG_POOL = None
 if _USE_POSTGRES:
     try:
         import psycopg2
         from psycopg2 import pool as _pg_pool_mod
-        _PG_POOL = _pg_pool_mod.ThreadedConnectionPool(10, 20, DATABASE_URL)
-        print(f"[db] PostgreSQL pool ready ({DATABASE_URL[:48]}...)")
     except ImportError:
         print("[db] WARN: psycopg2 not installed — falling back to SQLite")
         _USE_POSTGRES = False
-    except Exception as _pg_err:
-        print(f"[db] WARN: PostgreSQL unreachable ({_pg_err}) — falling back to SQLite")
-        _USE_POSTGRES = False
+        _pg_pool_mod = None
+
+    if _USE_POSTGRES:
+        _PG_CONNECT_ATTEMPTS = 5
+        _PG_CONNECT_BACKOFF_SECS = 2.0
+        _pg_last_err = None
+        for _pg_attempt in range(1, _PG_CONNECT_ATTEMPTS + 1):
+            try:
+                _PG_POOL = _pg_pool_mod.ThreadedConnectionPool(10, 20, DATABASE_URL)
+                print(f"[db] PostgreSQL pool ready ({DATABASE_URL[:48]}...) "
+                      f"on attempt {_pg_attempt}/{_PG_CONNECT_ATTEMPTS}")
+                break
+            except Exception as _pg_err:
+                _pg_last_err = _pg_err
+                print(f"[db] WARN: PostgreSQL connection attempt {_pg_attempt}/"
+                      f"{_PG_CONNECT_ATTEMPTS} failed ({_pg_err})")
+                if _pg_attempt < _PG_CONNECT_ATTEMPTS:
+                    time.sleep(_PG_CONNECT_BACKOFF_SECS)
+
+        if _PG_POOL is None:
+            if _APP_ENV_BOOT == "production":
+                raise RuntimeError(
+                    "FATAL: could not establish a PostgreSQL connection pool after "
+                    f"{_PG_CONNECT_ATTEMPTS} attempts ({_pg_last_err}). Refusing to "
+                    "fall back to ephemeral SQLite in production -- that would "
+                    "silently wipe player progress on every restart."
+                )
+            print(f"[db] WARN: PostgreSQL unreachable ({_pg_last_err}) — "
+                  "falling back to SQLite (development only)")
+            _USE_POSTGRES = False
 
 
 class _PgCursor:
@@ -2357,7 +2391,16 @@ async def add_to_piggy(request: Request, amount: int):
         raise HTTPException(status_code=400, detail="amount must be positive")
     if amount > 150:
         raise HTTPException(status_code=400, detail="amount exceeds per-call maximum of 150")
-    if not _check_burst_limit(player_id, "add_piggy", 1, 3.0):
+    # Merges (and combo cashouts) legitimately fire several add_piggy calls
+    # per second during a chain -- the old 1-call-per-3s limit silently
+    # dropped most of them (HTTP 429, "request dropped, no retry" client-side)
+    # while the client had ALREADY applied its optimistic local credit. The
+    # next call to land would then return the server's true (much lower)
+    # total, snapping the displayed balance back down -- the "increases then
+    # drops" bug. 30 calls / 10s comfortably covers real merge cadence
+    # (per-call amount is still hard-capped at 150) without opening the door
+    # to abuse.
+    if not _check_burst_limit(player_id, "add_piggy", 30, 10.0):
         raise HTTPException(
             status_code=429,
             detail={"status": "rate_limited",
@@ -2761,6 +2804,8 @@ async def cashout(request: Request):
         line_lengths = body.get("line_lengths", [])
         golden       = bool(body.get("golden_tile", False))
         combo_value  = int(body.get("combo_value", 1))
+        unique_tiles = body.get("unique_tiles", None)
+        unique_tiles = int(unique_tiles) if unique_tiles is not None else None
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
@@ -2783,8 +2828,15 @@ async def cashout(request: Request):
 
     # Anti-cheat: the board must actually hold enough tier (or golden) tiles to back
     # the claimed lines.  Bounds fabricated multi-line claims without a full re-detect.
-    needed = sum(safe_lengths)
-    have   = board.count(tier) + (board.count(GOLDEN_TILE_VALUE) if golden else 0)
+    # NOTE: combo lines (row/column/diagonal) can cross at shared cells, so summing
+    # line_lengths over-counts overlaps -- use the client's de-duplicated cleared-cell
+    # count when present (it mirrors the server-side unique-index set exactly), and
+    # fall back to the longest single line (a safe lower bound) for older clients.
+    if unique_tiles is not None and 0 < unique_tiles <= sum(safe_lengths):
+        needed = unique_tiles
+    else:
+        needed = max(safe_lengths)
+    have = board.count(tier) + (board.count(GOLDEN_TILE_VALUE) if golden else 0)
     if have < needed:
         logging.warning("ANTICHEAT cashout_claim_exceeds_board player=%s need=%s have=%s",
                         player_id, needed, have)
@@ -3226,6 +3278,11 @@ def get_balance(request: Request):
         "cashout_target_tier": cashout_target_tier,
         "gems_balance":        int(row[3]) if row[3] is not None else 10,
         "piggy_balance":       current_piggy,
+        # THE TREE-scaled ceiling (econ_piggy_cap mastery level -> get_piggy_cap);
+        # ships on every balance response so the gameplay HUD adopts the same
+        # dynamic cap the main-menu Piggy already gets via /piggy/state, instead
+        # of clamping to a hardcoded Tier-0 default.
+        "piggy_cap":           piggy_cap,
         "idle_piggy_gold":     idle_piggy_gold,
         "active_modifier":     str(row[5]) if row[5] is not None else "",
         "free_spin_available": free_spin_available,
