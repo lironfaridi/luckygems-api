@@ -14,6 +14,7 @@ import hmac
 import os
 import functools
 import logging
+import traceback
 from typing import List, Dict, Any
 
 # Requires: pip install PyJWT
@@ -1141,6 +1142,7 @@ def init_db():
         "total_spins":         "INTEGER DEFAULT 0",
         "player_xp":           "INTEGER DEFAULT 0",
         "player_level":        "INTEGER DEFAULT 1",
+        "max_tier_reached":    "INTEGER DEFAULT 0",
     }
     for _col, _defn in _new_ach_cols.items():
         if not column_exists(cursor, "players", _col):
@@ -4063,10 +4065,6 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     run_merges      = min(max(0, int(payload.get("run_merges",      0))), _MAX_MERGES_PER_RUN)
     run_combo_count = min(max(0, int(payload.get("run_combo_count", 0))), _MAX_COMBO_COUNT_RUN)
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
-
     # Additional run-level payload fields (clamped for anti-cheat).
     _MAX_HIGH_TIER_MERGES = 500
     _MAX_SINGLE_CASHOUT   = _MAX_CASH_PER_RUN
@@ -4076,110 +4074,120 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
     max_tier_merged_run  = min(max(0, int(payload.get("max_tier_merged",   0))), 11)
     is_new_pb_cashout    = False
 
-    cursor.execute("""
-        SELECT lifetime_cash_earned, best_survival_time, best_cashouts_run,
-               best_combo, cursed_tiles_removed, total_runs, total_merges,
-               high_tier_merges, best_session_merges, best_single_cashout,
-               peak_wallet_balance, total_money, board_stage,
-               COALESCE(max_tier_reached, 0)
-        FROM players
-        WHERE player_id = ?
-    """, (player_id,))
-
-    row = cursor.fetchone()
-
-    if row is None:
-        conn.close()
-        return {"status": "error", "message": "Player not found"}
-
-    lifetime_cash        = int(row[0]) + cash_earned
-    best_survival_time   = max(int(row[1]), survival_time)
-    best_cashouts_run    = max(int(row[2]), cashouts)
-    best_combo_overall   = max(int(row[3]), best_combo)
-    cursed_removed_total = int(row[4]) + cursed_removed
-    total_runs           = int(row[5]) + 1
-    total_merges         = int(row[6]) + run_merges
-    high_tier_merges_new = int(row[7] or 0) + high_tier_merges_run
-    best_session_merges  = max(int(row[8] or 0), run_merges)
-    prev_best_cashout    = int(row[9] or 0)
-    best_single_cashout  = max(prev_best_cashout, best_cashout_run)
-    if best_cashout_run > prev_best_cashout:
-        is_new_pb_cashout = True
-    new_total_money      = int(row[11] or 0) + cash_earned
-    peak_wallet_balance  = max(int(row[10] or 0), new_total_money)
-    board_stage_for_quest = int(row[12]) if row[12] is not None else 0
-    max_tier_reached_new  = max(int(row[13] or 0), max_tier_merged_run)
-
-    # max_tier_reached column: ADD IF MISSING (safe no-op when already present).
+    # The whole DB section is wrapped: any unexpected error (schema drift,
+    # bad payload, etc.) is logged and answered with a graceful JSON error
+    # instead of an unhandled 500 -- an unhandled exception here previously
+    # left the connection (or pooled PG connection) open/leaked, which could
+    # cascade into every other endpoint failing with connection errors.
+    conn = None
     try:
-        cursor.execute("ALTER TABLE players ADD COLUMN max_tier_reached INTEGER DEFAULT 0")
-    except Exception:
-        pass  # column already exists
+        conn = get_connection()
+        cursor = conn.cursor()
+        get_or_create_player(player_id, cursor)
 
-    cursor.execute("""
-        UPDATE players
-        SET lifetime_cash_earned = ?,
-            best_survival_time = ?,
-            best_cashouts_run = ?,
-            best_combo = ?,
-            cursed_tiles_removed = ?,
-            total_runs = ?,
-            total_merges = ?,
-            high_tier_merges = ?,
-            best_session_merges = ?,
-            best_single_cashout = ?,
-            peak_wallet_balance = ?,
-            max_tier_reached = ?,
-            is_rescue_active = 0
-        WHERE player_id = ?
-    """, (
-        lifetime_cash,
-        best_survival_time,
-        best_cashouts_run,
-        best_combo_overall,
-        cursed_removed_total,
-        total_runs,
-        total_merges,
-        high_tier_merges_new,
-        best_session_merges,
-        best_single_cashout,
-        peak_wallet_balance,
-        max_tier_reached_new,
-        player_id
-    ))
+        cursor.execute("""
+            SELECT lifetime_cash_earned, best_survival_time, best_cashouts_run,
+                   best_combo, cursed_tiles_removed, total_runs, total_merges,
+                   high_tier_merges, best_session_merges, best_single_cashout,
+                   peak_wallet_balance, total_money, board_stage,
+                   COALESCE(max_tier_reached, 0)
+            FROM players
+            WHERE player_id = ?
+        """, (player_id,))
 
-    newly_unlocked = check_and_unlock_achievements(cursor, player_id)
+        row = cursor.fetchone()
 
-    quest_result = evaluate_and_advance_quest(cursor, player_id, {
-        "survival_time":   survival_time,
-        "cashouts":        cashouts,
-        "cash_earned":     cash_earned,
-        "run_merges":      run_merges,
-        "run_combo_count": run_combo_count,
-    }, board_stage=board_stage_for_quest)
+        if row is None:
+            return {"status": "error", "message": "Player not found"}
 
-    combo_gems_awarded = min(run_combo_count // 3, 10)
-    if combo_gems_awarded > 0:
-        cursor.execute(
-            "UPDATE players SET gems_balance = COALESCE(gems_balance, 0) + ? WHERE player_id = ?",
-            (combo_gems_awarded, player_id)
-        )
+        lifetime_cash        = int(row[0]) + cash_earned
+        best_survival_time   = max(int(row[1]), survival_time)
+        best_cashouts_run    = max(int(row[2]), cashouts)
+        best_combo_overall   = max(int(row[3]), best_combo)
+        cursed_removed_total = int(row[4]) + cursed_removed
+        total_runs           = int(row[5]) + 1
+        total_merges         = int(row[6]) + run_merges
+        high_tier_merges_new = int(row[7] or 0) + high_tier_merges_run
+        best_session_merges  = max(int(row[8] or 0), run_merges)
+        prev_best_cashout    = int(row[9] or 0)
+        best_single_cashout  = max(prev_best_cashout, best_cashout_run)
+        if best_cashout_run > prev_best_cashout:
+            is_new_pb_cashout = True
+        new_total_money      = int(row[11] or 0) + cash_earned
+        peak_wallet_balance  = max(int(row[10] or 0), new_total_money)
+        board_stage_for_quest = int(row[12]) if row[12] is not None else 0
+        max_tier_reached_new  = max(int(row[13] or 0), max_tier_merged_run)
 
-    # XP grant: +10 base, +2 per merge, +5 per cashout, +20 if new personal best cashout.
-    xp_grant = 10 + (run_merges * 2) + (cashouts * 5) + (20 if is_new_pb_cashout else 0)
-    xp_info  = _grant_xp(cursor, player_id, xp_grant)
+        cursor.execute("""
+            UPDATE players
+            SET lifetime_cash_earned = ?,
+                best_survival_time = ?,
+                best_cashouts_run = ?,
+                best_combo = ?,
+                cursed_tiles_removed = ?,
+                total_runs = ?,
+                total_merges = ?,
+                high_tier_merges = ?,
+                best_session_merges = ?,
+                best_single_cashout = ?,
+                peak_wallet_balance = ?,
+                max_tier_reached = ?,
+                is_rescue_active = 0
+            WHERE player_id = ?
+        """, (
+            lifetime_cash,
+            best_survival_time,
+            best_cashouts_run,
+            best_combo_overall,
+            cursed_removed_total,
+            total_runs,
+            total_merges,
+            high_tier_merges_new,
+            best_session_merges,
+            best_single_cashout,
+            peak_wallet_balance,
+            max_tier_reached_new,
+            player_id
+        ))
 
-    cursor.execute("SELECT gems_balance FROM players WHERE player_id = ?", (player_id,))
-    _gems_row = cursor.fetchone()
-    new_gems_balance = int(_gems_row[0]) if _gems_row and _gems_row[0] is not None else 0
+        newly_unlocked = check_and_unlock_achievements(cursor, player_id)
 
-    try:
+        quest_result = evaluate_and_advance_quest(cursor, player_id, {
+            "survival_time":   survival_time,
+            "cashouts":        cashouts,
+            "cash_earned":     cash_earned,
+            "run_merges":      run_merges,
+            "run_combo_count": run_combo_count,
+        }, board_stage=board_stage_for_quest)
+
+        combo_gems_awarded = min(run_combo_count // 3, 10)
+        if combo_gems_awarded > 0:
+            cursor.execute(
+                "UPDATE players SET gems_balance = COALESCE(gems_balance, 0) + ? WHERE player_id = ?",
+                (combo_gems_awarded, player_id)
+            )
+
+        # XP grant: +10 base, +2 per merge, +5 per cashout, +20 if new personal best cashout.
+        xp_grant = 10 + (run_merges * 2) + (cashouts * 5) + (20 if is_new_pb_cashout else 0)
+        xp_info  = _grant_xp(cursor, player_id, xp_grant)
+
+        cursor.execute("SELECT gems_balance FROM players WHERE player_id = ?", (player_id,))
+        _gems_row = cursor.fetchone()
+        new_gems_balance = int(_gems_row[0]) if _gems_row and _gems_row[0] is not None else 0
+
         conn.commit()
-    except Exception as _commit_err:
-        print(f"[submit_run] commit error: {_commit_err}")
-        raise
+    except Exception as _run_err:
+        print(f"[submit_run] HTTP 500 averted -- {type(_run_err).__name__}: {_run_err}")
+        traceback.print_exc()
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"status": "error", "message": "Run stats could not be saved due to a server error. Your run was still recorded locally."}
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     # Elite meta accrual: advance event + chapter progress from the CLAMPED
     # (anti-cheat) run stats into the durable EliteStore. Pure Redis -- no DB
