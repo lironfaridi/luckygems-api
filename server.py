@@ -2391,8 +2391,13 @@ async def add_to_piggy(request: Request, amount: int):
     player_id = extract_player_id(request)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="amount must be positive")
-    if amount > 150:
-        raise HTTPException(status_code=400, detail="amount exceeds per-call maximum of 150")
+    # Rush Mode (Ember Blitz) plays a dense 6x6 board where multiple cashout
+    # lines can resolve in a single move -- piggy_add = 50 * number_of_lines
+    # + merge delta legitimately exceeds the old 150 cap (e.g. 4 simultaneous
+    # lines = 200), which previously bounced as HTTP 400. Raised to 500 to
+    # cover Rush's higher combo density without removing the anti-cheat cap.
+    if amount > 500:
+        raise HTTPException(status_code=400, detail="amount exceeds per-call maximum of 500")
     # Merges (and combo cashouts) legitimately fire several add_piggy calls
     # per second during a chain -- the old 1-call-per-3s limit silently
     # dropped most of them (HTTP 429, "request dropped, no retry" client-side)
@@ -5653,7 +5658,9 @@ async def player_rescue(request: Request):
     await _verify_financial_signature(request, raw_token)
     raw_body = await request.body()
     # Valid rescue costs mirror the client scoring formula: 5 / 10 / 15 / 20 gems.
-    _RESCUE_VALID_COSTS = {5, 10, 15, 20}
+    # 100 = Ember Blitz (Rush Mode) Daily Challenge revive: a fixed gems-only
+    # premium price, distinct from the standard board-value-scaled costs.
+    _RESCUE_VALID_COSTS = {5, 10, 15, 20, 100}
     _RESCUE_COST_MAX    = max(_RESCUE_VALID_COSTS)
     try:
         body = json.loads(raw_body) if raw_body else {}
