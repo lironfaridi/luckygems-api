@@ -2017,13 +2017,11 @@ async def get_config_flags(request: Request):
 
     FLAG_DEFINITIONS: Dict[str, list] = {
         "starter_pack_price":    ["standard", "discounted"],
-        "game_over_offer_style": ["modal", "banner"],
         "daily_reward_style":    ["calendar", "wheel"],
         "vault_pass_price":      ["6.99", "4.99", "9.99"],
     }
     FLAG_DEFAULTS: Dict[str, str] = {
         "starter_pack_price":    "standard",
-        "game_over_offer_style": "modal",
         "daily_reward_style":    "calendar",
         "vault_pass_price":      "6.99",
     }
@@ -5259,119 +5257,6 @@ _EVENT_SHOP_ITEMS = [
         "cost": 120, "currency": "shards",
     },
 ]
-
-
-@app.post("/offer/game_over")
-async def game_over_offer(request: Request):
-    """
-    Called immediately after a game ends. Evaluates whether the player was close
-    to a progression milestone and returns a targeted loss-aversion offer.
-    Returns {"offer": null} if no offer is appropriate.
-    """
-    player_id = extract_player_id(request)
-    try:
-        body         = await request.json()
-        cash_at_end  = int(body.get("cash_at_end",  0))
-        board_stage  = int(body.get("board_stage",  0))
-        cashouts_run = int(body.get("cashouts_run", 0))
-    except Exception:
-        return {"offer": None}
-
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        get_or_create_player(player_id, cursor)
-        cursor.execute(
-            "SELECT total_money, board_stage, gems_balance FROM players "
-            "WHERE player_id = ?", (player_id,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-    except Exception:
-        return {"offer": None}
-
-    total_gold = int(row[0]) if row and row[0] else 0
-    p_stage    = int(row[1]) if row and row[1] else 0
-    gems       = int(row[2]) if row and row[2] else 0
-
-    offer = None
-
-    # Milestone offer: player is within 30% of next board expansion cost
-    next_stage_idx = p_stage + 1
-    if next_stage_idx < len(BOARD_STAGES):
-        next_cost = BOARD_STAGES[next_stage_idx]["cost"]
-        deficit   = next_cost - total_gold
-        if 0 < deficit <= next_cost * 0.30:
-            gems_needed = max(20, min(150, int(deficit / 100)))
-            offer = {
-                "type":        "gem_boost",
-                "title":       "So Close!",
-                "body":        f"You need {deficit:,} more gold for your next board. "
-                               f"Get {gems_needed} Gems to push through!",
-                "cost_gems":   gems_needed,
-                "ttl_seconds": 60,
-                "affordable":  gems >= gems_needed,
-            }
-
-    return {"offer": offer}
-
-
-@app.post("/offer/accept")
-async def accept_offer(request: Request):
-    """
-    Deducts gems when the player accepts a game-over loss-aversion offer.
-    Requires X-Signature (HMAC-SHA256) matching /player/rescue pattern.
-    Body: {"offer_type": str, "cost_gems": int}
-    Returns: {"status": "success", "offer_type": str, "gems_spent": int, "new_gems": int}
-    """
-    player_id, raw_token = extract_auth(request)
-    await _verify_financial_signature(request, raw_token)
-    raw_body = await request.body()
-    try:
-        body       = json.loads(raw_body) if raw_body else {}
-        offer_type = str(body.get("offer_type", "")).strip()
-        cost_gems  = int(body.get("cost_gems", 0))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-    if not offer_type:
-        raise HTTPException(status_code=400, detail="offer_type is required")
-    if cost_gems < 0:
-        raise HTTPException(status_code=400, detail="cost_gems must be >= 0")
-
-    conn   = get_connection()
-    cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
-    cursor.execute("SELECT gems_balance FROM players WHERE player_id = ?", (player_id,))
-    row = cursor.fetchone()
-    if row is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    gems = int(row[0]) if row[0] is not None else 0
-    if cost_gems > 0 and gems < cost_gems:
-        conn.close()
-        return {"status": "error", "message": "Not enough Gems", "cost_gems": cost_gems, "gems": gems}
-
-    if cost_gems > 0:
-        cursor.execute(
-            "UPDATE players SET gems_balance = gems_balance - ? WHERE player_id = ?",
-            (cost_gems, player_id)
-        )
-    cursor.execute("SELECT gems_balance FROM players WHERE player_id = ?", (player_id,))
-    new_gems = int(cursor.fetchone()[0])
-
-    try:
-        cursor.execute(
-            "INSERT INTO telemetry_logs (player_id, event_name, event_data, session_id) VALUES (?, ?, ?, ?)",
-            (player_id, "offer_accepted", json.dumps({"offer_type": offer_type, "gems_spent": cost_gems}), "server")
-        )
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
-    _invalidate_balance_cache(player_id)
-    return {"status": "success", "offer_type": offer_type, "gems_spent": cost_gems, "new_gems": new_gems}
 
 
 @app.get("/shop/cosmetics")
