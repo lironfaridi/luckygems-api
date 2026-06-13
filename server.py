@@ -1668,14 +1668,29 @@ _COMMON_RARITIES: set = {"common"}
 import math as _math
 _WHEEL_SLICE_ANGLE: float = 2.0 * _math.pi / len(WHEEL_PRIZES)
 
-# Escalating re-spin costs (indexed by spins already done today).
-# Index 0 = first spin (free). Index 3+ = 40 Gems.
-RESPIN_COSTS = [0, 10, 20, 40]
+# Daily spin pricing: the first spin of each calendar day is free; every
+# subsequent spin that day costs a flat 15 Purple Gems.
+RESPIN_COSTS = [0, 15]
 
 
 def _get_spin_cost(spins_today: int) -> int:
     idx = min(spins_today, len(RESPIN_COSTS) - 1)
     return RESPIN_COSTS[idx]
+
+
+def _effective_spins_today(spins_raw: int, last_reset_str, now_utc: "datetime.datetime") -> tuple:
+    """Applies the calendar-day reset to the player's spin counter without
+    writing to the DB. Returns (effective_spins, reset_needed)."""
+    today_date = now_utc.date()
+    if last_reset_str is not None:
+        try:
+            last_reset_date = datetime.datetime.fromisoformat(str(last_reset_str)).date()
+            if last_reset_date < today_date:
+                return 0, True
+            return spins_raw, False
+        except Exception:
+            return 0, True
+    return 0, True
 
 # GemBoost permanent upgrades -- progressive cost curve.
 # Index N-1 = gem cost to reach Level N (e.g. index 0 is the Lvl1 purchase price).
@@ -2591,8 +2606,11 @@ async def claim_daily_reward(request: Request):
     )
     actual_gems = _award_free_gems(cursor, player_id, gems_grant, today_str)
     if free_spin:
+        # Grant a bonus Lucky Spin: reset the unified daily spin counter so
+        # /wheel/state and /wheel/spin both see a free spin available, even
+        # if the player already used today's free spin.
         cursor.execute(
-            "UPDATE players SET last_free_spin_time = NULL WHERE player_id = ?",
+            "UPDATE players SET last_free_spin_time = NULL, spins_today = 0, last_spin_reset = NULL WHERE player_id = ?",
             (player_id,)
         )
 
@@ -2882,27 +2900,10 @@ async def cashout(request: Request):
         logging.warning("ANTICHEAT cashout_over_cap player=%s total=%s", player_id, total)
         total = _MAX_CASHOUT_PAYOUT
 
-    # --- Credit + Vault Pass 1.5x (same rule as /bank/deposit) ---
+    # --- Credit ---
     conn   = get_connection()
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
-
-    vault_pass_bonus = 0
-    if total > 0:
-        cursor.execute(
-            "SELECT vault_pass_active, vault_pass_expiry FROM players WHERE player_id = ?",
-            (player_id,)
-        )
-        _vp = cursor.fetchone()
-        _vp_on  = bool(int(_vp[0]) if _vp and _vp[0] is not None else 0)
-        _vp_exp = str(_vp[1]) if _vp and _vp[1] is not None else ""
-        if _vp_on and _vp_exp:
-            try:
-                if datetime.datetime.utcnow() < datetime.datetime.fromisoformat(_vp_exp):
-                    vault_pass_bonus = int(total * 0.5)
-                    total += vault_pass_bonus
-            except (ValueError, OverflowError):
-                pass
 
     cursor.execute(
         "UPDATE players SET total_money = total_money + ? WHERE player_id = ?",
@@ -2915,10 +2916,9 @@ async def cashout(request: Request):
     _invalidate_balance_cache(player_id)
 
     return {
-        "status":           "success",
-        "granted":          total,
-        "vault_pass_bonus": vault_pass_bonus,
-        "new_balance":      new_balance,
+        "status":      "success",
+        "granted":     total,
+        "new_balance": new_balance,
     }
 
 
@@ -2962,27 +2962,6 @@ async def deposit_money(request: Request):
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
 
-    # Vault Pass 1.5x gold multiplier on all positive cashout deposits.
-    vault_pass_bonus = 0
-    if amount > 0:
-        cursor.execute(
-            "SELECT vault_pass_active, vault_pass_expiry FROM players WHERE player_id = ?",
-            (player_id,)
-        )
-        _vp_row = cursor.fetchone()
-        _vp_on  = bool(int(_vp_row[0]) if _vp_row and _vp_row[0] is not None else 0)
-        _vp_exp = str(_vp_row[1]) if _vp_row and _vp_row[1] is not None else ""
-        if _vp_on and _vp_exp:
-            try:
-                _now_check = datetime.datetime.utcnow()
-                _exp_check = datetime.datetime.fromisoformat(_vp_exp)
-                if _now_check < _exp_check:
-                    _bonus_amount = int(amount * 0.5)
-                    vault_pass_bonus = _bonus_amount
-                    amount = amount + _bonus_amount
-            except (ValueError, OverflowError):
-                pass
-
     cursor.execute(
         "UPDATE players SET total_money = total_money + ? WHERE player_id = ?",
         (amount, player_id)
@@ -3023,8 +3002,6 @@ async def deposit_money(request: Request):
     resp = {"status": "success", "amount": amount, "new_balance": balance}
     if first_cashout_bonus_gems > 0:
         resp["first_cashout_bonus_gems"] = first_cashout_bonus_gems
-    if vault_pass_bonus > 0:
-        resp["vault_pass_bonus"] = vault_pass_bonus
     resp.update(xp_info)
     return resp
 
@@ -3134,39 +3111,10 @@ def get_balance(request: Request):
             (now_utc.isoformat(), player_id)
         )
 
-    # ------------------------------------------------------------------
-    # Vault Pass daily drip: +10 Gems once per calendar day while active.
-    # row[26]=vault_pass_active, row[27]=vault_pass_expiry,
-    # row[28]=shards_balance,    row[29]=last_vault_pass_drip
-    # ------------------------------------------------------------------
+    # Vault Pass deprecated -- always report inactive/dead values to the client.
     vault_pass_daily_gems = 0
-    vp_raw_active  = bool(int(row[26]) if row[26] is not None else 0)
-    vp_expiry_str  = str(row[27]) if row[27] is not None else ""
-    vp_days_left   = 0
-    vp_is_active   = False
-    if vp_raw_active and vp_expiry_str:
-        try:
-            vp_expiry_dt = datetime.datetime.fromisoformat(vp_expiry_str)
-            if now_utc < vp_expiry_dt:
-                vp_is_active = True
-                vp_days_left = max(0, (vp_expiry_dt.date() - now_utc.date()).days)
-                last_vp_drip = str(row[29]) if row[29] is not None else ""
-                if last_vp_drip != today_bal:
-                    vault_pass_daily_gems = 10
-                    cursor.execute(
-                        "UPDATE players SET gems_balance = gems_balance + 10, "
-                        "last_vault_pass_drip = ? WHERE player_id = ?",
-                        (today_bal, player_id)
-                    )
-            else:
-                # Pass expired -- persist the deactivation so subsequent reads
-                # don't re-evaluate the expiry date on every call.
-                cursor.execute(
-                    "UPDATE players SET vault_pass_active = 0 WHERE player_id = ?",
-                    (player_id,)
-                )
-        except (ValueError, OverflowError):
-            pass
+    vp_days_left          = 0
+    vp_is_active          = False
 
     # ------------------------------------------------------------------
     # Rescue flag auto-expiry: if is_rescue_active was set but the server
@@ -4846,6 +4794,44 @@ async def unlock_catalyst(request: Request):
     return {"status": "success", "unlocked": "catalyst_core", "cost": cost_gems, "currency": "gems", "new_gems": gems - cost_gems}
 
 
+@app.get("/wheel/state")
+async def wheel_state(request: Request):
+    """Read-only snapshot of today's Lucky Spin pricing -- lets the client
+    show the correct FREE / 15-Gem state on the main menu and every time the
+    spin window is (re)opened, without ever mutating spin counters."""
+    player_id = extract_player_id(request)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    get_or_create_player(player_id, cursor)
+    cursor.execute("""
+        SELECT gems_balance, spins_today, last_spin_reset
+        FROM players WHERE player_id = ?
+    """, (player_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return {"status": "error", "message": "Player not found"}
+
+    gems       = int(row[0]) if row[0] is not None else 0
+    spins_raw  = int(row[1]) if row[1] is not None else 0
+    last_reset_str = row[2]
+
+    now_utc = datetime.datetime.utcnow()
+    effective_spins, _reset_needed = _effective_spins_today(spins_raw, last_reset_str, now_utc)
+
+    spin_cost = _get_spin_cost(effective_spins)
+    is_free   = (spin_cost == 0)
+
+    return {
+        "status":       "success",
+        "is_free":      is_free,
+        "spin_cost":    spin_cost,
+        "spins_today":  effective_spins,
+        "gems_balance": gems,
+    }
+
+
 @app.post("/wheel/spin")
 async def spin_wheel(request: Request):
     player_id = extract_player_id(request)
@@ -4878,22 +4864,8 @@ async def spin_wheel(request: Request):
     pity_counter   = int(row[6]) if row[6] is not None else 0
 
     # Calendar-day reset for spin counter (same pattern as piggy smashes).
-    now_utc    = datetime.datetime.utcnow()
-    today_date = now_utc.date()
-    effective_spins = spins_raw
-    reset_needed    = False
-    if last_reset_str is not None:
-        try:
-            last_reset_date = datetime.datetime.fromisoformat(str(last_reset_str)).date()
-            if last_reset_date < today_date:
-                effective_spins = 0
-                reset_needed    = True
-        except Exception:
-            effective_spins = 0
-            reset_needed    = True
-    else:
-        effective_spins = 0
-        reset_needed    = True
+    now_utc = datetime.datetime.utcnow()
+    effective_spins, reset_needed = _effective_spins_today(spins_raw, last_reset_str, now_utc)
 
     spin_cost = _get_spin_cost(effective_spins)
     is_free   = (spin_cost == 0)
@@ -4901,12 +4873,16 @@ async def spin_wheel(request: Request):
     if spin_cost > 0:
         if gems < spin_cost:
             conn.close()
-            return {
-                "status":          "error",
-                "message":         f"Need {spin_cost} Gems to spin again today",
-                "spin_cost":       spin_cost,
-                "next_spin_cost":  spin_cost,
-            }
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status":          "error",
+                    "message":         f"Need {spin_cost} Gems to spin again today",
+                    "spin_cost":       spin_cost,
+                    "next_spin_cost":  spin_cost,
+                    "gems_balance":    gems,
+                },
+            )
         gems -= spin_cost
         cursor.execute(
             "UPDATE players SET gems_balance = ? WHERE player_id = ?",
@@ -6719,31 +6695,10 @@ async def shop_starter_pack(request: Request):
 @app.post("/iap/vault_pass/activate")
 async def activate_vault_pass(request: Request):
     """
-    Activates the Vault Pass for the calling player for 30 days.
-    Replace with real receipt validation before shipping.
+    DEPRECATED: Vault Pass has been removed from the game. This endpoint is
+    permanently stubbed and never alters player state.
     """
-    player_id, raw_token = extract_auth(request)
-    await _verify_financial_signature(request, raw_token)
-    now_utc   = datetime.datetime.utcnow()
-    expiry    = now_utc + datetime.timedelta(days=30)
-
-    conn   = get_connection()
-    cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
-    cursor.execute(
-        "UPDATE players SET vault_pass_active = 1, vault_pass_expiry = ? WHERE player_id = ?",
-        (expiry.isoformat(), player_id)
-    )
-    conn.commit()
-    conn.close()
-    _invalidate_balance_cache(player_id)
-
-    return {
-        "status":             "success",
-        "vault_pass_active":  True,
-        "vault_pass_expiry":  expiry.isoformat(),
-        "vault_pass_days_left": 30,
-    }
+    raise HTTPException(status_code=410, detail="Feature deprecated")
 
 
 @app.get("/event/shop")
