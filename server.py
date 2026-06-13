@@ -1002,6 +1002,10 @@ def init_db():
     if not column_exists(cursor, "players", "has_seen_starter_pack"):
         cursor.execute("ALTER TABLE players ADD COLUMN has_seen_starter_pack INTEGER DEFAULT 0")
 
+    # Marketplace "Starter Deal" (bundle_welcome) is a strictly one-time IAP.
+    if not column_exists(cursor, "players", "has_purchased_starter"):
+        cursor.execute("ALTER TABLE players ADD COLUMN has_purchased_starter INTEGER DEFAULT 0")
+
     # --- Push notification bookkeeping (retention) ---
     if not column_exists(cursor, "players", "piggy_full_since"):
         cursor.execute("ALTER TABLE players ADD COLUMN piggy_full_since TEXT DEFAULT NULL")
@@ -6739,6 +6743,16 @@ def _credit_gem_bundle(player_id: str, product_id: str, cursor) -> Dict[str, Any
     if bundle is None:
         raise ValueError(f"Unknown gem bundle product_id: {product_id}")
 
+    # The Starter Deal (bundle_welcome) is a strictly one-time purchase.
+    if product_id == "bundle_welcome":
+        cursor.execute(
+            "SELECT has_purchased_starter FROM players WHERE player_id = ?",
+            (player_id,)
+        )
+        _row = cursor.fetchone()
+        if _row and int(_row[0] or 0) == 1:
+            raise ValueError("Starter Deal already purchased")
+
     gems       = int(bundle["gems"])
     gold       = int(bundle.get("gold", 0))
     price_usd  = float(bundle["usd"])
@@ -6758,6 +6772,12 @@ def _credit_gem_bundle(player_id: str, product_id: str, cursor) -> Dict[str, Any
            WHERE player_id = ?""",
         (total_gems, gold, price_usd, player_id)
     )
+
+    if product_id == "bundle_welcome":
+        cursor.execute(
+            "UPDATE players SET has_purchased_starter = 1 WHERE player_id = ?",
+            (player_id,)
+        )
 
     # Sales log entry for the base purchase.
     # item_level=0 for IAP bundles (column is INTEGER; product_id is stored in the sales log
@@ -6799,6 +6819,7 @@ async def iap_catalog(request: Request):
     Authenticated callers also receive first_purchase_available.
     """
     first_purchase_available = False
+    has_purchased_starter    = False
     auth_header = request.headers.get("Authorization", "").strip()
     if auth_header.startswith("Bearer "):
         try:
@@ -6806,17 +6827,20 @@ async def iap_catalog(request: Request):
             conn_cat   = get_connection()
             cur_cat    = conn_cat.cursor()
             cur_cat.execute(
-                "SELECT first_iap_done FROM players WHERE player_id = ?", (player_id,)
+                "SELECT first_iap_done, has_purchased_starter FROM players WHERE player_id = ?",
+                (player_id,)
             )
             row_cat = cur_cat.fetchone()
             conn_cat.close()
             fip = int(row_cat[0]) if row_cat and row_cat[0] is not None else 0
             first_purchase_available = (fip == 0)
+            has_purchased_starter = bool(row_cat[1]) if row_cat and row_cat[1] is not None else False
         except Exception:
             pass
     return {
         "bundles":                  GEM_BUNDLES,
         "first_purchase_available": first_purchase_available,
+        "has_purchased_starter":    has_purchased_starter,
     }
 
 
