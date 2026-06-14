@@ -35,8 +35,8 @@ CATALOGS = {
     ],
     "boosts": [
         {"id": "boost_cashout_2x",   "name": "2x Cashout Multiplier", "description": "All cashouts pay double for 10 minutes.",     "cost_gold": 10000, "duration_min": 10, "icon": "res://assets/icon_boost_cashout_2x.png"},
-        {"id": "boost_board_shield", "name": "Board Shield",          "description": "Delays Cursed Tile spawns by 1.5x, giving you more time and moves to strategize.", "cost_gold": 5000,  "duration_min": 60, "icon": "res://assets/icon_boost_board_shield.png"},
-        {"id": "boost_lucky_drop",   "name": "Lucky Drop",            "description": "Next 10 tile spawns are guaranteed max tier.", "cost_gold": 12000, "duration_min": 45, "icon": "res://assets/icon_boost_lucky_drop.png"},
+        {"id": "boost_board_shield", "name": "Board Shield",          "description": "Delays Cursed Tile spawns by 1.5x, giving you more time and moves to strategize.", "cost_gold": 7000,  "duration_min": 25, "icon": "res://assets/icon_boost_board_shield.png"},
+        {"id": "boost_lucky_drop",   "name": "Lucky Drop",            "description": "Guarantees your next 15 tile spawns are max tier. Expires after 10 minutes.", "cost_gold": 15000, "duration_min": 10, "icon": "res://assets/icon_boost_lucky_drop.png"},
     ],
     "special_tiles": [
         {"id": "wildcard_core",    "name": "Wildcard Gem",    "description": "A wildcard gem auto-spawns and merges with any normal gem.",             "cost":  20, "currency": "gems", "req_tier": 4, "icon": "res://assets/wildcard.png",                     "tooltip": "Merges with any normal gem to instantly upgrade it!",                 "requires": ""},

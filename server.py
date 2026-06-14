@@ -779,14 +779,14 @@ VAULT_BOOSTS = {
     "boost_board_shield": {
         "name":         "Board Shield",
         "description":  "Delays Cursed Tile spawns by 1.5x, giving you more time and moves to strategize.",
-        "cost_gold":    5_000,
-        "duration_min": 60,
+        "cost_gold":    7_000,
+        "duration_min": 25,
     },
     "boost_lucky_drop": {
         "name":         "Lucky Drop",
-        "description":  "Next 10 tile spawns are guaranteed max tier.",
-        "cost_gold":    12_000,
-        "duration_min": 45,
+        "description":  "Guarantees your next 15 tile spawns are max tier. Expires after 10 minutes.",
+        "cost_gold":    15_000,
+        "duration_min": 10,
     },
 }
 
