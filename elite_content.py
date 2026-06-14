@@ -34,8 +34,8 @@ CATALOGS = {
         {"item_id": "gems_6000",      "name": "Titan Reserve",     "price": "$49.99", "gems": 6000, "gold":    0, "variant": "gold",   "badge": "BEST VALUE"},
     ],
     "boosts": [
-        {"id": "boost_cashout_2x",   "name": "2x Cashout Multiplier", "description": "All cashouts pay double for 30 minutes.",     "cost_gold": 8000,  "duration_min": 30, "icon": "res://assets/icon_boost_cashout_2x.png"},
-        {"id": "boost_board_shield", "name": "Board Shield",          "description": "Blocks the next cursed tile spawn.",           "cost_gold": 5000,  "duration_min": 60, "icon": "res://assets/icon_boost_board_shield.png"},
+        {"id": "boost_cashout_2x",   "name": "2x Cashout Multiplier", "description": "All cashouts pay double for 10 minutes.",     "cost_gold": 10000, "duration_min": 10, "icon": "res://assets/icon_boost_cashout_2x.png"},
+        {"id": "boost_board_shield", "name": "Board Shield",          "description": "Delays Cursed Tile spawns by 1.5x, giving you more time and moves to strategize.", "cost_gold": 5000,  "duration_min": 60, "icon": "res://assets/icon_boost_board_shield.png"},
         {"id": "boost_lucky_drop",   "name": "Lucky Drop",            "description": "Next 10 tile spawns are guaranteed max tier.", "cost_gold": 12000, "duration_min": 45, "icon": "res://assets/icon_boost_lucky_drop.png"},
     ],
     "special_tiles": [

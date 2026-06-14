@@ -772,13 +772,13 @@ def _get_quest_multiplier(board_stage: int) -> float:
 VAULT_BOOSTS = {
     "boost_cashout_2x": {
         "name":         "2x Cashout Multiplier",
-        "description":  "All cashouts pay double for 30 minutes.",
-        "cost_gold":    8_000,
-        "duration_min": 30,
+        "description":  "All cashouts pay double for 10 minutes.",
+        "cost_gold":    10_000,
+        "duration_min": 10,
     },
     "boost_board_shield": {
         "name":         "Board Shield",
-        "description":  "Blocks the next cursed tile spawn.",
+        "description":  "Delays Cursed Tile spawns by 1.5x, giving you more time and moves to strategize.",
         "cost_gold":    5_000,
         "duration_min": 60,
     },
@@ -5049,7 +5049,7 @@ async def spin_wheel(request: Request):
     boost_activated: bool = False
     if prize["id"] == "boost_cashout_2x":
         boost_cfg = VAULT_BOOSTS.get("boost_cashout_2x", {})
-        dur_min   = int(boost_cfg.get("duration_min", 30))
+        dur_min   = int(boost_cfg.get("duration_min", 10))
         _grant_boost(cursor, player_id, "boost_cashout_2x", dur_min, now_utc)
         boost_activated = True
 
