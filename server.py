@@ -2898,14 +2898,32 @@ async def cashout(request: Request):
         total = int(total * (1.0 + bonus_pct))
 
     total = max(0, total)
-    if total > _MAX_CASHOUT_PAYOUT:
-        logging.warning("ANTICHEAT cashout_over_cap player=%s total=%s", player_id, total)
-        total = _MAX_CASHOUT_PAYOUT
 
     # --- Credit ---
     conn   = get_connection()
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
+
+    # Vault Boost: 2x Cashout Multiplier doubles the payout while the purchased
+    # boost window (boost_active_until) has not expired.
+    cursor.execute(
+        "SELECT boost_active_until, boost_type FROM players WHERE player_id = ?",
+        (player_id,)
+    )
+    _brow = cursor.fetchone()
+    if _brow and _brow[1] == "boost_cashout_2x" and _brow[0]:
+        try:
+            _bexp = datetime.datetime.fromisoformat(str(_brow[0]))
+            if _bexp.tzinfo is None:
+                _bexp = _bexp.replace(tzinfo=datetime.timezone.utc)
+            if datetime.datetime.now(datetime.timezone.utc) < _bexp:
+                total *= 2
+        except ValueError:
+            pass
+
+    if total > _MAX_CASHOUT_PAYOUT:
+        logging.warning("ANTICHEAT cashout_over_cap player=%s total=%s", player_id, total)
+        total = _MAX_CASHOUT_PAYOUT
 
     cursor.execute(
         "UPDATE players SET total_money = total_money + ? WHERE player_id = ?",
