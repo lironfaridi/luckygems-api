@@ -51,29 +51,9 @@ CATALOGS = {
         {"id": "ch_merges_50",     "title": "Merge Apprentice", "goal_id": "run_merges",              "target": 50,   "reward": {"gems": 20}},
         {"id": "ch_big_cashout",   "title": "Big Score",        "goal_id": "run_best_single_cashout", "target": 2000, "reward": {"gems": 30}},
     ],
-    "estate_rooms": [
-        {
-            "id": "room_foyer", "name": "The Grand Foyer", "bg_asset": "res://assets/estate/foyer_bg.png",
-            "reward": {"gems": 25}, "unlock_requires": "",
-            "tasks": [
-                {"id": "foyer_floor",      "label": "Marble Floor",       "cost": 800,  "asset_broken": "res://assets/estate/foyer_floor_broken.png",      "asset_restored": "res://assets/estate/foyer_floor.png",      "state": "broken"},
-                {"id": "foyer_chandelier", "label": "Crystal Chandelier", "cost": 1500, "asset_broken": "res://assets/estate/foyer_chandelier_broken.png", "asset_restored": "res://assets/estate/foyer_chandelier.png", "state": "broken"},
-                {"id": "foyer_doors",      "label": "Golden Doors",       "cost": 1200, "asset_broken": "res://assets/estate/foyer_doors_broken.png",      "asset_restored": "res://assets/estate/foyer_doors.png",      "state": "broken"},
-            ],
-        },
-        {
-            "id": "room_treasury", "name": "The Treasury", "bg_asset": "res://assets/estate/treasury_bg.png",
-            "reward": {"gems": 40}, "unlock_requires": "room_foyer",
-            "tasks": [
-                {"id": "treasury_vault_door", "label": "Vault Door",  "cost": 2500, "asset_broken": "res://assets/estate/treasury_door_broken.png",    "asset_restored": "res://assets/estate/treasury_door.png",    "state": "broken"},
-                {"id": "treasury_shelves",    "label": "Gem Shelves", "cost": 2000, "asset_broken": "res://assets/estate/treasury_shelves_broken.png", "asset_restored": "res://assets/estate/treasury_shelves.png", "state": "broken"},
-            ],
-        },
-    ],
     "events": [
         {"id": "ev_weekend_cup", "type": "tournament",   "title": "Weekend Cashout Cup", "ends_at": 0, "progress_goal_id": "run_cashouts",      "progress": 0, "milestones": [{"threshold": 5, "reward": {"gems": 10}, "claimed": False}, {"threshold": 15, "reward": {"gems": 25}, "claimed": False}, {"threshold": 40, "reward": {"gems": 60}, "claimed": False}], "rewards": {}},
         {"id": "ev_curse_purge", "type": "shard_rush",   "title": "Curse Purge",         "ends_at": 0, "progress_goal_id": "run_cursed_removed", "progress": 0, "milestones": [{"threshold": 20, "reward": {"gems": 8}, "claimed": False}, {"threshold": 80, "reward": {"gems": 30}, "claimed": False}], "rewards": {}},
-        {"id": "ev_estate_gala", "type": "estate_event", "title": "Estate Gala",         "ends_at": 0, "progress_goal_id": "run_merges",         "progress": 0, "milestones": [{"threshold": 100, "reward": {"type": "estate_decor", "label": "Gala Banner"}, "claimed": False}, {"threshold": 400, "reward": {"gems": 40}, "claimed": False}], "rewards": {}},
     ],
     "offers": {
         "default": {"product_id": "gems_350",      "title": "Starter Deal",   "blurb": "A solid first pickup.",      "badge": "DEAL"},
@@ -331,83 +311,6 @@ def complete_chapter(pid, chapter_id):
     if nxt:
         out["next_chapter_id"] = nxt
     return out
-
-
-# ---------------------------------------------------------------------------
-#  Vault Estate
-# ---------------------------------------------------------------------------
-def _room_of_task(task_id):
-    for r in CATALOGS["estate_rooms"]:
-        for t in r["tasks"]:
-            if t["id"] == task_id:
-                return r
-    return None
-
-
-def _task_cost(task_id):
-    for r in CATALOGS["estate_rooms"]:
-        for t in r["tasks"]:
-            if t["id"] == task_id:
-                return int(t["cost"])
-    return None
-
-
-def _maybe_pay_room(pid, room):
-    fkey = "elite:estate_funded:%s" % pid
-    pkey = "elite:estate_paid:%s" % pid
-    funded = STORE.smembers(fkey)
-    rid = room["id"]
-    if not STORE.sismember(pkey, rid) and all(t["id"] in funded for t in room["tasks"]):
-        STORE.sadd(pkey, rid)
-        _wallet_add_gems(pid, int(room.get("reward", {}).get("gems", 0)))
-
-
-def estate_state(pid):
-    funded = STORE.smembers("elite:estate_funded:%s" % pid)
-    cur = ""
-    for r in CATALOGS["estate_rooms"]:
-        if not all(t["id"] in funded for t in r["tasks"]):
-            cur = r["id"]
-            break
-    if not cur and CATALOGS["estate_rooms"]:
-        cur = CATALOGS["estate_rooms"][-1]["id"]
-    return {"current_room_id": cur, "funded_tasks": sorted(funded)}
-
-
-def fund_task(pid, task_id, _client_cost):
-    cost = _task_cost(task_id)
-    if cost is None:
-        return {"status": "error", "message": "Unknown task"}
-    fkey = "elite:estate_funded:%s" % pid
-    if not STORE.sismember(fkey, task_id):
-        if not _wallet_spend_gold(pid, cost):
-            return {"status": "error", "message": "Insufficient funds"}
-        STORE.sadd(fkey, task_id)
-        room = _room_of_task(task_id)
-        if room:
-            _maybe_pay_room(pid, room)
-    return {"status": "success", "task_id": task_id,
-            "funded_tasks": sorted(STORE.smembers(fkey)),
-            "new_balance": _wallet_get(pid)["gold"]}
-
-
-def finish_room(pid, room_id):
-    room = next((r for r in CATALOGS["estate_rooms"] if r["id"] == room_id), None)
-    if room is None:
-        return {"status": "error", "message": "Unknown room"}
-    fkey = "elite:estate_funded:%s" % pid
-    funded = STORE.smembers(fkey)
-    remaining = [t for t in room["tasks"] if t["id"] not in funded]
-    gem_price = len(remaining) * 25
-    if gem_price > 0:
-        if not _wallet_spend_gems(pid, gem_price):
-            return {"status": "error", "message": "Insufficient gems"}
-        for t in remaining:
-            STORE.sadd(fkey, t["id"])
-        _maybe_pay_room(pid, room)
-    return {"status": "success",
-            "funded_tasks": sorted(STORE.smembers(fkey)),
-            "new_balance": _wallet_get(pid)["gold"]}
 
 
 # ---------------------------------------------------------------------------

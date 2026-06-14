@@ -7480,33 +7480,6 @@ async def elite_complete_chapter(request: Request):
     return _elite.complete_chapter(player_id, str(body.get("chapter_id", "")))
 
 
-@app.get("/estate/state")
-def elite_estate_state(request: Request):
-    return _elite.estate_state(extract_player_id(request))
-
-
-@app.post("/estate/fund_task")
-async def elite_fund_task(request: Request):
-    player_id, raw_token = extract_auth(request)
-    await _verify_financial_signature(request, raw_token)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-    return _elite.fund_task(player_id, str(body.get("task_id", "")), int(body.get("cost", 0)))
-
-
-@app.post("/estate/finish_room")
-async def elite_finish_room(request: Request):
-    player_id, raw_token = extract_auth(request)
-    await _verify_financial_signature(request, raw_token)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-    return _elite.finish_room(player_id, str(body.get("room_id", "")))
-
-
 @app.get("/album/state")
 def elite_album_state(request: Request):
     return _elite.album_state(extract_player_id(request))
