@@ -834,6 +834,58 @@ def column_exists(cursor, table_name: str, column_name: str) -> bool:
     return column_name in [row[1] for row in cursor.fetchall()]
 
 
+def get_active_boosts(player_id: str, cursor) -> dict[str, int]:
+    """Returns {boost_id: seconds_left} for every unexpired boost belonging to
+    player_id, lazily deleting any rows that have expired."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cursor.execute(
+        "SELECT boost_id, expires_at FROM player_boosts WHERE player_id = ?",
+        (player_id,)
+    )
+    active: dict[str, int] = {}
+    expired_ids: list[str] = []
+    for boost_id, expires_at in cursor.fetchall():
+        exp = datetime.datetime.fromisoformat(str(expires_at))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        if exp > now_utc:
+            active[boost_id] = int((exp - now_utc).total_seconds())
+        else:
+            expired_ids.append(boost_id)
+    for boost_id in expired_ids:
+        cursor.execute(
+            "DELETE FROM player_boosts WHERE player_id = ? AND boost_id = ?",
+            (player_id, boost_id)
+        )
+    return active
+
+
+def _grant_boost(cursor, player_id: str, boost_id: str, duration_min: int,
+                 now_utc: datetime.datetime) -> datetime.datetime:
+    """Activate (or extend) a timed boost for player_id. If the same boost_id
+    is already running, the new duration stacks on top of its current expiry;
+    otherwise it starts fresh from now_utc. Returns the resulting expiry."""
+    cursor.execute(
+        "SELECT expires_at FROM player_boosts WHERE player_id = ? AND boost_id = ?",
+        (player_id, boost_id)
+    )
+    row  = cursor.fetchone()
+    base = now_utc
+    if row:
+        existing = datetime.datetime.fromisoformat(str(row[0]))
+        if existing.tzinfo is None:
+            existing = existing.replace(tzinfo=datetime.timezone.utc)
+        if existing > now_utc:
+            base = existing
+    expires = base + datetime.timedelta(minutes=duration_min)
+    cursor.execute(
+        "INSERT INTO player_boosts (player_id, boost_id, expires_at) VALUES (?, ?, ?) "
+        "ON CONFLICT (player_id, boost_id) DO UPDATE SET expires_at = excluded.expires_at",
+        (player_id, boost_id, expires.isoformat())
+    )
+    return expires
+
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
@@ -1114,7 +1166,7 @@ def init_db():
             "ALTER TABLE players ADD COLUMN last_gem_cap_reset TEXT DEFAULT NULL"
         )
 
-    # --- P6-S3: Vault Boost active-boost tracking ---
+    # --- P6-S3: Vault Boost active-boost tracking (legacy, read-only) ---
     if not column_exists(cursor, "players", "boost_active_until"):
         cursor.execute(
             "ALTER TABLE players ADD COLUMN boost_active_until TEXT DEFAULT NULL"
@@ -1123,6 +1175,45 @@ def init_db():
         cursor.execute(
             "ALTER TABLE players ADD COLUMN boost_type TEXT DEFAULT NULL"
         )
+
+    # --- Concurrent Multi-Boost System: player_boosts table ---
+    # One row per (player, boost) currently-or-recently active. Replaces the
+    # single boost_type/boost_active_until columns above, which are kept
+    # (read-only) only for the one-time backfill below.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_boosts (
+            player_id  TEXT        NOT NULL,
+            boost_id   TEXT        NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (player_id, boost_id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_boosts_player_id "
+        "ON player_boosts (player_id)"
+    )
+
+    # One-time backfill: carry forward any still-active legacy single-boost
+    # row into player_boosts. Safe to re-run -- ON CONFLICT no-ops re-inserts.
+    cursor.execute(
+        "SELECT player_id, boost_type, boost_active_until FROM players "
+        "WHERE boost_type IS NOT NULL AND boost_active_until IS NOT NULL"
+    )
+    _now_backfill = datetime.datetime.now(datetime.timezone.utc)
+    for _bp_player, _bp_type, _bp_until in cursor.fetchall():
+        try:
+            _bp_exp = datetime.datetime.fromisoformat(str(_bp_until))
+            if _bp_exp.tzinfo is None:
+                _bp_exp = _bp_exp.replace(tzinfo=datetime.timezone.utc)
+            if _bp_exp > _now_backfill:
+                cursor.execute(
+                    "INSERT INTO player_boosts (player_id, boost_id, expires_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (player_id, boost_id) DO NOTHING",
+                    (_bp_player, _bp_type, _bp_exp.isoformat())
+                )
+        except (ValueError, TypeError):
+            pass
 
     # JSON blob keyed by offer_id; value is 1 when the offer has been shown.
     # e.g. {"board_stage4_wall": 1}
@@ -2904,22 +2995,11 @@ async def cashout(request: Request):
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
 
-    # Vault Boost: 2x Cashout Multiplier doubles the payout while the purchased
-    # boost window (boost_active_until) has not expired.
-    cursor.execute(
-        "SELECT boost_active_until, boost_type FROM players WHERE player_id = ?",
-        (player_id,)
-    )
-    _brow = cursor.fetchone()
-    if _brow and _brow[1] == "boost_cashout_2x" and _brow[0]:
-        try:
-            _bexp = datetime.datetime.fromisoformat(str(_brow[0]))
-            if _bexp.tzinfo is None:
-                _bexp = _bexp.replace(tzinfo=datetime.timezone.utc)
-            if datetime.datetime.now(datetime.timezone.utc) < _bexp:
-                total *= 2
-        except ValueError:
-            pass
+    # Vault Boost: 2x Cashout Multiplier doubles the payout while active.
+    # Other concurrently-active boosts (board shield, lucky drop) are
+    # orthogonal and require no special-case handling here.
+    if "boost_cashout_2x" in get_active_boosts(player_id, cursor):
+        total *= 2
 
     if total > _MAX_CASHOUT_PAYOUT:
         logging.warning("ANTICHEAT cashout_over_cap player=%s total=%s", player_id, total)
@@ -3169,10 +3249,15 @@ def get_balance(request: Request):
     _bal_level = int(_xp_row[1]) if _xp_row and _xp_row[1] is not None else 1
     _bal_xp_bar = _xp_bar_info(_bal_xp, _bal_level)
 
+    # Concurrent Multi-Boost System: fetch all unexpired boosts before closing
+    # the connection (the helper lazily deletes expired rows).
+    _active_boosts_dict = get_active_boosts(player_id, cursor)
+
     conn.commit()
     conn.close()
 
-    # row[32] = install_date   row[33] = boost_active_until   row[34] = boost_type
+    # row[32] = install_date   row[33]/row[34] = legacy boost_active_until/boost_type
+    # (unused -- superseded by player_boosts, kept in SELECT for index stability)
     install_date_str   = str(row[32]) if row[32] is not None else None
     days_since_install = 0
     if install_date_str:
@@ -3184,21 +3269,14 @@ def get_balance(request: Request):
         except (ValueError, TypeError):
             pass
 
-    _boost_until_str = str(row[33]) if row[33] is not None else ""
-    _boost_type_str  = str(row[34]) if row[34] is not None else ""
-    _active_boost    = None
-    _boost_secs_left = 0
-    if _boost_until_str and _boost_type_str:
-        try:
-            _boost_exp = datetime.datetime.fromisoformat(_boost_until_str)
-            if _boost_exp.tzinfo is None:
-                _boost_exp = _boost_exp.replace(tzinfo=datetime.timezone.utc)
-            _now_aware = now_utc.replace(tzinfo=datetime.timezone.utc)
-            if _now_aware < _boost_exp:
-                _active_boost    = _boost_type_str
-                _boost_secs_left = int((_boost_exp - _now_aware).total_seconds())
-        except (ValueError, OverflowError):
-            pass
+    # Concurrent Multi-Boost System: build the full active_boosts array, plus
+    # legacy singular fields (derived from the first entry) for old clients.
+    _active_boosts_list = [
+        {"id": bid, "seconds_left": secs}
+        for bid, secs in _active_boosts_dict.items()
+    ]
+    _active_boost    = _active_boosts_list[0]["id"] if _active_boosts_list else None
+    _boost_secs_left = _active_boosts_list[0]["seconds_left"] if _active_boosts_list else 0
 
     stage = get_stage(int(row[2]))
     cashout_target_tier = int(row[1])
@@ -3296,6 +3374,7 @@ def get_balance(request: Request):
         "days_since_install":     days_since_install,
         "active_boost":           _active_boost,
         "boost_seconds_left":     _boost_secs_left,
+        "active_boosts":          _active_boosts_list,
         "player_xp":              _bal_xp,
         "player_level":           _bal_level,
         "xp_in_level":            _bal_xp_bar["xp_in_level"],
@@ -4965,16 +5044,13 @@ async def spin_wheel(request: Request):
             (prize["modifier"], player_id)
         )
 
-    # Vault Boost prize: activate timed boost columns so /bank/balance returns it.
+    # Vault Boost prize: activate (or extend) the timed boost in player_boosts
+    # so /bank/balance and /cashout pick it up immediately.
     boost_activated: bool = False
     if prize["id"] == "boost_cashout_2x":
-        boost_cfg  = VAULT_BOOSTS.get("boost_cashout_2x", {})
-        dur_min    = int(boost_cfg.get("duration_min", 30))
-        expires_at = (now_utc + datetime.timedelta(minutes=dur_min)).isoformat()
-        cursor.execute(
-            "UPDATE players SET boost_type = ?, boost_active_until = ? WHERE player_id = ?",
-            ("boost_cashout_2x", expires_at, player_id)
-        )
+        boost_cfg = VAULT_BOOSTS.get("boost_cashout_2x", {})
+        dur_min   = int(boost_cfg.get("duration_min", 30))
+        _grant_boost(cursor, player_id, "boost_cashout_2x", dur_min, now_utc)
         boost_activated = True
 
     # Pending board modifier (Golden Diamonds + free hammers -- injected at next run)
@@ -5166,32 +5242,27 @@ async def get_boosts(request: Request):
     cursor = conn.cursor()
     get_or_create_player(player_id, cursor)
     cursor.execute(
-        "SELECT total_money, boost_active_until, boost_type "
-        "FROM players WHERE player_id = ?", (player_id,)
+        "SELECT total_money FROM players WHERE player_id = ?", (player_id,)
     )
-    row = cursor.fetchone()
+    row  = cursor.fetchone()
+    gold = int(row[0]) if row and row[0] else 0
+
+    active_boosts_dict = get_active_boosts(player_id, cursor)
+    conn.commit()
     conn.close()
-    gold    = int(row[0]) if row and row[0] else 0
-    b_until = str(row[1]) if row and row[1] else ""
-    b_type  = str(row[2]) if row and row[2] else ""
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    active_boost = None
-    seconds_left = 0
-    if b_until and b_type:
-        try:
-            exp = datetime.datetime.fromisoformat(b_until)
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=datetime.timezone.utc)
-            if now_utc < exp:
-                active_boost = b_type
-                seconds_left = int((exp - now_utc).total_seconds())
-        except ValueError:
-            pass
+
+    active_boosts_list = [
+        {"id": bid, "seconds_left": secs}
+        for bid, secs in active_boosts_dict.items()
+    ]
     return {
         "status":       "ok",
         "gold_balance": gold,
-        "active_boost": active_boost,
-        "seconds_left": seconds_left,
+        # Legacy singular fields (derived from the first active boost) kept
+        # for old clients; new clients should read "active_boosts".
+        "active_boost": active_boosts_list[0]["id"] if active_boosts_list else None,
+        "seconds_left": active_boosts_list[0]["seconds_left"] if active_boosts_list else 0,
+        "active_boosts": active_boosts_list,
         "boosts":       [
             {**v, "id": k, "affordable": gold >= v["cost_gold"]}
             for k, v in VAULT_BOOSTS.items()
@@ -5224,14 +5295,15 @@ async def buy_boost(request: Request):
     if gold < boost["cost_gold"]:
         conn.close()
         return {"status": "error", "message": "Insufficient gold"}
-    now_utc  = datetime.datetime.now(datetime.timezone.utc)
-    expires  = now_utc + datetime.timedelta(minutes=boost["duration_min"])
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
     cursor.execute(
-        "UPDATE players SET total_money = total_money - ?, "
-        "boost_active_until = ?, boost_type = ? "
-        "WHERE player_id = ?",
-        (boost["cost_gold"], expires.isoformat(), boost_id, player_id)
+        "UPDATE players SET total_money = total_money - ? WHERE player_id = ?",
+        (boost["cost_gold"], player_id)
     )
+    # Extend semantics: re-buying the same boost_id while it's still running
+    # stacks the new duration on top of its current expiry; a different
+    # boost_id (or an expired one) starts fresh and runs concurrently.
+    expires = _grant_boost(cursor, player_id, boost_id, boost["duration_min"], now_utc)
     conn.commit()
     conn.close()
     _invalidate_balance_cache(player_id)
@@ -5239,7 +5311,7 @@ async def buy_boost(request: Request):
         "status":       "success",
         "boost_id":     boost_id,
         "expires_at":   expires.isoformat(),
-        "seconds_left": boost["duration_min"] * 60,
+        "seconds_left": int((expires - now_utc).total_seconds()),
     }
 
 
