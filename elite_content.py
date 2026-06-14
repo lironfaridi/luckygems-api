@@ -34,9 +34,9 @@ CATALOGS = {
         {"item_id": "gems_6000",      "name": "Titan Reserve",     "price": "$49.99", "gems": 6000, "gold":    0, "variant": "gold",   "badge": "BEST VALUE"},
     ],
     "boosts": [
-        {"id": "boost_cashout_2x", "name": "Cashout Boost x2",  "description": "All cashout payouts are doubled for the duration.",        "cost_gold": 500, "duration_min": 15, "icon": "res://assets/golden_crystal.png"},
-        {"id": "boost_spawn_rate", "name": "Lucky Spawn Boost", "description": "Higher-tier gems spawn more frequently on the board.",     "cost_gold": 750, "duration_min": 20, "icon": "res://assets/GEM2.png"},
-        {"id": "boost_piggy_fill", "name": "Piggy Rush",        "description": "Gold deposited per merge into the Piggy Bank is doubled.", "cost_gold": 400, "duration_min": 30, "icon": "res://assets/icon_piggy.png"},
+        {"id": "boost_cashout_2x",   "name": "2x Cashout Multiplier", "description": "All cashouts pay double for 30 minutes.",     "cost_gold": 8000,  "duration_min": 30, "icon": "res://assets/icon_boost_cashout_2x.png"},
+        {"id": "boost_board_shield", "name": "Board Shield",          "description": "Blocks the next cursed tile spawn.",           "cost_gold": 5000,  "duration_min": 60, "icon": "res://assets/icon_boost_board_shield.png"},
+        {"id": "boost_lucky_drop",   "name": "Lucky Drop",            "description": "Next 10 tile spawns are guaranteed max tier.", "cost_gold": 12000, "duration_min": 45, "icon": "res://assets/icon_boost_lucky_drop.png"},
     ],
     "special_tiles": [
         {"id": "wildcard_core",    "name": "Wildcard Gem",    "description": "A wildcard gem auto-spawns and merges with any normal gem.",             "cost":  20, "currency": "gems", "req_tier": 4, "icon": "res://assets/wildcard.png",                     "tooltip": "Merges with any normal gem to instantly upgrade it!",                 "requires": ""},
