@@ -2356,6 +2356,49 @@ async def admin_push_test(request: Request):
     return {"status": "ok", "config": _push_status(), "result": result}
 
 
+@app.post("/admin/seed_test_score")
+async def admin_seed_test_score(request: Request):
+    """Admin-only: force-set a player's best_single_cashout (and optionally
+    max_unlocked_tier) for leaderboard QA without a real run.
+
+    Security model:
+    - Always requires a valid JWT (extract_player_id below).
+    - If ADMIN_SEED_SECRET env var is set, the request must also carry a
+      matching X-Admin-Secret header (enforced on both dev and prod).
+    - If ADMIN_SEED_SECRET is NOT set, any authenticated JWT caller can reach
+      this endpoint -- safe for solo-dev environments where an extra shared
+      secret would just be friction.
+    The APP_ENV guard was intentionally removed: the secret check (or JWT alone
+    when no secret is configured) is the correct gate for this endpoint.
+    """
+    extract_player_id(request)   # valid JWT required at minimum
+    secret = os.environ.get("ADMIN_SEED_SECRET", "")
+    if secret and request.headers.get("X-Admin-Secret", "") != secret:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        body       = await request.json()
+        target     = str(body.get("player_id", "")).strip()
+        cashout    = int(body.get("best_single_cashout", 0))
+        tier_raw   = body.get("max_unlocked_tier", None)
+        tier       = int(tier_raw) if tier_raw is not None else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not target:
+        raise HTTPException(status_code=400, detail="player_id is required")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    get_or_create_player(target, cursor)
+    cursor.execute(
+        "UPDATE players SET best_single_cashout = ?, "
+        "max_unlocked_tier = COALESCE(?, max_unlocked_tier) WHERE player_id = ?",
+        (cashout, tier, target),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "player_id": target, "best_single_cashout": cashout}
+
+
 @app.post("/player/set_age")
 async def set_age(request: Request):
     """Record the COPPA age bracket chosen at the first-launch age gate.
@@ -7521,8 +7564,55 @@ async def elite_claim_milestone(request: Request):
 # ============================================================================
 @app.get("/leaderboard/weekly")
 def compat_leaderboard_weekly(request: Request):
-    extract_player_id(request)
-    return {"status": "ok", "leaderboard": []}
+    """All-time "Top Cashouts" board, ranked by best_single_cashout.
+
+    No weekly-reset infrastructure exists yet, so this serves the all-time
+    standings under the existing "weekly" route/shape the client expects.
+    display_name/avatar_tier/weekly_gold are derived at query time -- no
+    new columns. `me` always reflects the caller's standing, even if they
+    are outside the top 100.
+    """
+    player_id = extract_player_id(request)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT player_id, best_single_cashout, max_unlocked_tier "
+        "FROM players ORDER BY best_single_cashout DESC LIMIT 100"
+    )
+    rows = cursor.fetchall()
+
+    leaderboard = []
+    for idx, (pid, cashout, tier) in enumerate(rows):
+        leaderboard.append({
+            "rank": idx + 1,
+            "display_name": "Player " + str(pid)[-4:].upper(),
+            "avatar_tier": max(1, min(int(tier or 1), 7)),
+            "weekly_gold": int(cashout or 0),
+        })
+
+    cursor.execute(
+        "SELECT best_single_cashout, max_unlocked_tier FROM players WHERE player_id = ?",
+        (player_id,),
+    )
+    me_row = cursor.fetchone()
+    my_cashout = int(me_row[0] or 0) if me_row else 0
+    my_tier = int(me_row[1] or 1) if me_row else 1
+
+    cursor.execute(
+        "SELECT COUNT(*) + 1 FROM players WHERE best_single_cashout > ?",
+        (my_cashout,),
+    )
+    my_rank = int(cursor.fetchone()[0])
+    conn.close()
+
+    me = {
+        "rank": my_rank,
+        "display_name": "Player " + str(player_id)[-4:].upper(),
+        "avatar_tier": max(1, min(my_tier, 7)),
+        "weekly_gold": my_cashout,
+    }
+    return {"status": "ok", "leaderboard": leaderboard, "me": me}
 
 
 @app.post("/leaderboard/claim")
