@@ -193,7 +193,7 @@ if _USE_POSTGRES:
         _pg_last_err = None
         for _pg_attempt in range(1, _PG_CONNECT_ATTEMPTS + 1):
             try:
-                _PG_POOL = _pg_pool_mod.ThreadedConnectionPool(10, 20, DATABASE_URL)
+                _PG_POOL = _pg_pool_mod.ThreadedConnectionPool(2, 8, DATABASE_URL)
                 print(f"[db] PostgreSQL pool ready ({DATABASE_URL[:48]}...) "
                       f"on attempt {_pg_attempt}/{_PG_CONNECT_ATTEMPTS}")
                 break
@@ -404,6 +404,7 @@ def _check_rate_limit(player_id: str, endpoint: str, min_interval_secs: float) -
 # Sliding-window burst limiter (count-based, per-player, per-endpoint)
 # ---------------------------------------------------------------------------
 _BURST_RATE_STORE: Dict[str, list] = {}
+_IP_RATE_STORE:    Dict[str, list] = {}  # keyed by IP string; in-process fallback only
 
 def _check_burst_limit(player_id: str, endpoint: str,
                        max_calls: int, window_secs: float) -> bool:
@@ -441,6 +442,36 @@ def _check_burst_limit(player_id: str, endpoint: str,
         return False
     timestamps.append(now)
     _BURST_RATE_STORE[key] = timestamps
+    return True
+
+
+def _check_ip_rate_limit(ip: str, limit: int = 5, window_secs: int = 60) -> bool:
+    """IP-level sliding-window rate limiter for unauthenticated endpoints.
+
+    Uses Redis INCR+EXPIRE when available -- safe across multi-worker deployments
+    because the counter lives in shared Redis memory, not a per-process dict.
+    Falls back to in-process dict for single-worker / no-Redis environments.
+    Returns True (allow) or False (block).
+    """
+    if _REDIS is not None:
+        try:
+            key   = f"ratelimit:ip:{ip}"
+            count = _REDIS.incr(key)
+            if count == 1:
+                _REDIS.expire(key, window_secs)  # set TTL on first hit only
+            return count <= limit
+        except Exception:
+            pass  # Redis unavailable: fail open so legitimate registrations succeed
+    # In-process fallback (single-worker / no Redis configured).
+    now  = time.monotonic()
+    ikey = f"ip:{ip}"
+    hits = _IP_RATE_STORE.get(ikey, [])
+    hits = [t for t in hits if now - t < window_secs]
+    if len(hits) >= limit:
+        _IP_RATE_STORE[ikey] = hits
+        return False
+    hits.append(now)
+    _IP_RATE_STORE[ikey] = hits
     return True
 
 
@@ -2054,6 +2085,15 @@ async def register_device(request: Request):
     The client stores the JWT in user://player_auth.save and attaches it as
     'Authorization: Bearer <token>' on every subsequent request.
     """
+    # IP-level guard: 5 registrations per minute per IP prevents bot floods from
+    # bloating the player table with millions of phantom accounts.
+    _client_ip = request.client.host if request.client else "unknown"
+    if not _check_ip_rate_limit(_client_ip, limit=5, window_secs=60):
+        raise HTTPException(
+            status_code=429,
+            detail={"error":   "rate_limited",
+                    "message": "Too many registration attempts. Try again in a minute."},
+        )
     try:
         body      = await request.json()
         player_id = str(body.get("player_id", "")).strip()
@@ -2468,39 +2508,114 @@ async def set_age(request: Request):
     return {"status": "ok", "age_under_13": under_13}
 
 
+@app.get("/quests/daily")
+async def get_daily_quests(request: Request):
+    """Returns today's 3 deterministic daily quests for this player.
+
+    Selection is SHA256(player_id + ':' + UTC date) seeded -- the same 3 quests
+    are returned for the entire calendar day across all restarts, with zero DB
+    writes for the selection step.  Claim status is read from quest_claims.
+    """
+    player_id = extract_player_id(request)
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    active_ids = _daily_quest_ids_for(player_id, today_str)
+
+    claimed: set = set()
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT quest_id FROM quest_claims "
+            "WHERE player_id = ? AND claim_day = ?",
+            (player_id, today_str),
+        )
+        claimed = {row[0] for row in cursor.fetchall()}
+    finally:
+        if conn is not None:
+            conn.close()
+
+    quests = []
+    for qid in active_ids:
+        q = _DAILY_QUEST_MAP.get(qid)
+        if q:
+            quests.append({
+                "id":      q["id"],
+                "title":   q["title"],
+                "desc":    q["desc"],
+                "type":    q["type"],
+                "target":  q["target"],
+                "gold":    q["gold"],
+                "gems":    q["gems"],
+                "claimed": qid in claimed,
+            })
+
+    return {
+        "status":              "ok",
+        "date":                today_str,
+        "quests":              quests,
+        "seconds_until_reset": _seconds_until_reset(),
+    }
+
+
 @app.post("/quests/claim")
 async def claim_quest(request: Request, quest_id: str):
     player_id = extract_player_id(request)
-    if quest_id not in DAILY_QUEST_GEM_REWARDS:
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    # Deterministic validation: re-run the same SHA256 seed computation used by
+    # /quests/daily.  The quest_id must be in this player's active set for today --
+    # a client cannot submit an arbitrary quest_id to claim a reward it did not earn.
+    active_ids = _daily_quest_ids_for(player_id, today_str)
+    if quest_id not in active_ids:
+        return {"status": "error", "message": "Quest not in today's active set"}
+
+    q = _DAILY_QUEST_MAP.get(quest_id)
+    if not q:
         return {"status": "error", "message": "Unknown quest_id"}
-    purple_gems = DAILY_QUEST_GEM_REWARDS[quest_id]
-    if purple_gems <= 0:
-        return {"status": "ok", "gems_awarded": 0}
-    today_day = str(int(datetime.datetime.utcnow().timestamp() // 86400))
-    conn = get_connection()
-    cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
+
+    conn = None
+    row  = None
     try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        get_or_create_player(player_id, cursor)
+        try:
+            cursor.execute(
+                "INSERT INTO quest_claims (player_id, quest_id, claim_day) "
+                "VALUES (?, ?, ?)",
+                (player_id, quest_id, today_str),
+            )
+        except Exception:
+            # UNIQUE constraint violation -- quest already claimed today.
+            return {"status": "already_claimed", "message": "Quest already claimed today"}
+
+        gold_grant  = q["gold"]
+        gems_grant  = q["gems"]
+        actual_gems = _award_free_gems(cursor, player_id, gems_grant, today_str)
         cursor.execute(
-            "INSERT INTO quest_claims (player_id, quest_id, claim_day) VALUES (?, ?, ?)",
-            (player_id, quest_id, today_day)
+            "UPDATE players SET total_money = total_money + ? WHERE player_id = ?",
+            (gold_grant, player_id),
         )
-    except Exception:
-        conn.close()
-        return {"status": "error", "message": "Quest already claimed today"}
-    today_str_q = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    actual_quest_gems = _award_free_gems(cursor, player_id, purple_gems, today_str_q)
-    cursor.execute("SELECT gems_balance FROM players WHERE player_id = ?", (player_id,))
-    row = cursor.fetchone()
-    new_gems = int(row[0]) if row and row[0] is not None else 0
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            "SELECT gems_balance, total_money FROM players WHERE player_id = ?",
+            (player_id,),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+    finally:
+        if conn is not None:
+            conn.close()
+
     _invalidate_balance_cache(player_id)
     return {
-        "status":          "success",
-        "gems_awarded":    actual_quest_gems,
-        "new_gems_balance": new_gems,
-        "cap_reached":     actual_quest_gems < purple_gems,
+        "status":           "success",
+        "quest_id":         quest_id,
+        "gold_awarded":     q["gold"],
+        "gems_awarded":     actual_gems,
+        "new_gems_balance": int(row[0]) if row else 0,
+        "new_balance":      int(row[1]) if row else 0,
+        "cap_reached":      actual_gems < gems_grant,
     }
 
 
@@ -3858,6 +3973,48 @@ ACHIEVEMENT_CONFIG = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Daily quest system -- server-seeded deterministic selection
+# 15-item pool; SHA256(player_id + ':' + UTC date) picks 3 each day.
+# No DB writes for selection -- claims are the only persistent event.
+# ---------------------------------------------------------------------------
+_DAILY_QUEST_POOL: List[Dict[str, Any]] = [
+    # id                 title                   desc                                           type               target  gold  gems
+    {"id": "daily_cashout",   "title": "Cashout Artist",  "desc": "Cashout 2 times.",                   "type": "cashouts",        "target": 2,    "gold": 400,  "gems": 3},
+    {"id": "daily_cursed",    "title": "Curse Breaker",   "desc": "Remove 3 cursed tiles.",             "type": "cursed_removed",  "target": 3,    "gold": 300,  "gems": 3},
+    {"id": "daily_runs",      "title": "Keep Rolling",    "desc": "Complete 2 runs.",                   "type": "run_count",       "target": 2,    "gold": 350,  "gems": 3},
+    {"id": "daily_combo",     "title": "Combo Chaser",    "desc": "Hit a 3x combo.",                    "type": "best_combo",      "target": 3,    "gold": 400,  "gems": 3},
+    {"id": "daily_survival",  "title": "Endurance Test",  "desc": "Survive 60 seconds in a run.",       "type": "survival_time",   "target": 60,   "gold": 350,  "gems": 3},
+    {"id": "daily_merges",    "title": "Merge Machine",   "desc": "Merge 30 times.",                    "type": "run_merges",      "target": 30,   "gold": 400,  "gems": 3},
+    {"id": "daily_highscore", "title": "Big Earner",      "desc": "Earn $2,000 in a single run.",       "type": "cash_earned",     "target": 2000, "gold": 500,  "gems": 2},
+    {"id": "daily_merges2",   "title": "Merge Overdrive", "desc": "Merge 60 times.",                    "type": "run_merges",      "target": 60,   "gold": 600,  "gems": 2},
+    {"id": "daily_cashout2",  "title": "Five-Star Run",   "desc": "Cashout 5 times.",                   "type": "cashouts",        "target": 5,    "gold": 600,  "gems": 3},
+    {"id": "daily_survival2", "title": "Marathon Mode",   "desc": "Survive 120 seconds in a run.",      "type": "survival_time",   "target": 120,  "gold": 700,  "gems": 3},
+    {"id": "daily_combo2",    "title": "Combo King",      "desc": "Hit a 5x combo.",                    "type": "best_combo",      "target": 5,    "gold": 750,  "gems": 4},
+    {"id": "daily_runs3",     "title": "Grind Day",       "desc": "Complete 4 runs.",                   "type": "run_count",       "target": 4,    "gold": 600,  "gems": 5},
+    {"id": "daily_tools",     "title": "Tool Master",     "desc": "Use 3 tools in a single run.",       "type": "tools_used",      "target": 3,    "gold": 500,  "gems": 4},
+    {"id": "daily_tier5",     "title": "Gem Seeker",      "desc": "Unlock a tier-5 gem in a run.",      "type": "max_tier_seen",   "target": 5,    "gold": 600,  "gems": 4},
+    {"id": "daily_golden",    "title": "Golden Touch",    "desc": "Cashout with a Golden Tile active.", "type": "golden_cashouts", "target": 1,    "gold": 800,  "gems": 5},
+]
+_DAILY_QUEST_MAP: Dict[str, Dict] = {q["id"]: q for q in _DAILY_QUEST_POOL}
+
+
+def _daily_quest_ids_for(player_id: str, date_str: str) -> list:
+    """Deterministic 3-quest selection for (player, day).
+
+    SHA256(player_id + ':' + date_str) produces a 64-bit seed that drives a
+    seeded Fisher-Yates shuffle of the pool.  Same inputs always give the same
+    3 quests, so the client and server can independently verify membership
+    without any database round-trip for the selection step.
+    """
+    seed_bytes = hashlib.sha256(f"{player_id}:{date_str}".encode()).digest()
+    seed_int   = int.from_bytes(seed_bytes[:8], "big")
+    pool_ids   = [q["id"] for q in _DAILY_QUEST_POOL]
+    rng        = random.Random(seed_int)
+    rng.shuffle(pool_ids)
+    return pool_ids[:3]
+
+
 # Server-authoritative purple gem amounts per quest_id.
 # Must stay in sync with DAILY_POOL in rewards_center.gd.
 DAILY_QUEST_GEM_REWARDS: Dict[str, int] = {
@@ -4219,7 +4376,10 @@ def get_stats_state(request: Request):
 
 @app.post("/stats/submit_run")
 async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)):
-    player_id = extract_player_id(request)
+    # HMAC-signed: leaderboard weekly_cashout is written here, so this endpoint
+    # requires the same financial-signature guard used on all economy writes.
+    player_id, raw_token = extract_auth(request)
+    await _verify_financial_signature(request, raw_token)
 
     # Rate limit: prevent rapid repeat submissions (accidental double-fire or replay attack).
     if not _check_rate_limit(player_id, "submit_run", min_interval_secs=5.0):
@@ -5447,9 +5607,16 @@ async def buy_boost(request: Request):
 
 
 _COSMETIC_PRICES = {
-    "cosmic_void":    {"price":  5000, "currency": "gold"},
-    "deep_ocean":     {"price": 15000, "currency": "gold"},
-    "ember_forge":    {"price": 30000, "currency": "gold"},
+    # --- Standard tier (gold) ---
+    "cosmic_void":    {"price":   5_000, "currency": "gold"},
+    "deep_ocean":     {"price":  15_000, "currency": "gold"},
+    "ember_forge":    {"price":  30_000, "currency": "gold"},
+    # --- High-tier late-game gold sinks ---
+    "void_eclipse":   {"price":  50_000, "currency": "gold"},
+    "aurora_prism":   {"price":  80_000, "currency": "gold"},
+    "titan_steel":    {"price": 120_000, "currency": "gold"},
+    "sovereign_void": {"price": 200_000, "currency": "gold"},
+    # --- Premium (gems) ---
     "arcane_grove":   {"price":   250, "currency": "gems"},
     "royal_obsidian": {"price":   600, "currency": "gems"},
     # Shard-priced event items -- purchasable via /shop/buy_cosmetic or /event/shop/buy
@@ -6366,116 +6533,19 @@ async def mark_offer_seen(request: Request):
 @app.post("/iap/purchase")
 async def iap_purchase(request: Request):
     """
-    Production IAP endpoint.  Receives {item_id} in the JSON body, validates
-    against IAP_CATALOG, credits the player, and returns new balances.
-    Replace the credit logic with real receipt validation before shipping.
+    DEPRECATED -- route permanently closed (HTTP 410).
+    All billing must go through /iap/validate/google (Google Play) or
+    /iap/validate/apple (App Store), which perform authoritative receipt
+    verification before crediting any currency.  No DB writes occur here.
     """
-    player_id, raw_token = extract_auth(request)
-    await _verify_financial_signature(request, raw_token)
-    try:
-        body    = await request.json()
-        item_id = str(body.get("item_id", "")).strip()
-    except Exception:
-        return {"status": "error", "message": "Invalid JSON body"}
-
-    if item_id not in IAP_CATALOG:
-        return {"status": "error", "message": f"Unknown item_id: {item_id}"}
-
-    platform   = str(body.get("platform", "ios")).lower()
-    receipt    = str(body.get("receipt",  ""))
-    product_id = item_id   # store product IDs match item_id; adjust if App Store Connect differs
-
-    receipt_ok = await _validate_receipt(platform, item_id, receipt, product_id)
-    if not receipt_ok:
-        raise HTTPException(
-            status_code=403,
-            detail="Receipt validation failed -- purchase not credited"
-        )
-
-    item       = IAP_CATALOG[item_id]
-    gems_grant = item["gems"]
-    gold_grant = item["gold"]
-
-    conn   = get_connection()
-    cursor = conn.cursor()
-    get_or_create_player(player_id, cursor)
-
-    cursor.execute(
-        """UPDATE players
-               SET gems_balance  = gems_balance  + ?,
-                   total_money   = total_money   + ?
-           WHERE player_id = ?""",
-        (gems_grant, gold_grant, player_id)
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error":   "deprecated",
+            "status":  410,
+            "message": "All billing must go through /iap/validate/google",
+        },
     )
-
-    # Vault Pass activation via IAP
-    now_utc_iap = datetime.datetime.now(datetime.timezone.utc)
-    if item.get("vault_pass"):
-        vp_expiry = now_utc_iap + datetime.timedelta(days=item["days"])
-        cursor.execute(
-            "UPDATE players SET vault_pass_active = 1, vault_pass_expiry = ? "
-            "WHERE player_id = ?",
-            (vp_expiry.isoformat(), player_id)
-        )
-
-    # Exclusive cosmetic unlock via IAP (append to unlocked_cosmetics JSON array)
-    excl_cosm = item.get("exclusive_cosmetic")
-    if excl_cosm:
-        cursor.execute(
-            "SELECT unlocked_cosmetics FROM players WHERE player_id = ?", (player_id,)
-        )
-        uc_row = cursor.fetchone()
-        try:
-            uc_list = json.loads(uc_row[0]) if uc_row and uc_row[0] else []
-        except Exception:
-            uc_list = []
-        if excl_cosm not in uc_list:
-            uc_list.append(excl_cosm)
-        cursor.execute(
-            "UPDATE players SET unlocked_cosmetics = ? WHERE player_id = ?",
-            (json.dumps(uc_list), player_id)
-        )
-
-    # Track lifetime revenue and log BI event
-    price_usd = float(IAP_CATALOG.get(item_id, {}).get("price_usd", "0") or "0")
-    if price_usd > 0:
-        cursor.execute(
-            "UPDATE players SET lifetime_iap_usd = lifetime_iap_usd + ? "
-            "WHERE player_id = ?",
-            (price_usd, player_id)
-        )
-    try:
-        cursor.execute(
-            "INSERT INTO telemetry_logs "
-            "(player_id, event_name, event_data, session_id) "
-            "VALUES (?, ?, ?, ?)",
-            (player_id, "iap_purchase",
-             json.dumps({"item_id": item_id,
-                         "gems_granted": gems_grant,
-                         "revenue_usd": price_usd,
-                         "platform": platform}),
-             "server")
-        )
-    except Exception:
-        pass   # telemetry failure must never block a purchase
-
-    cursor.execute(
-        "SELECT gems_balance, total_money FROM players WHERE player_id = ?",
-        (player_id,)
-    )
-    row = cursor.fetchone()
-    conn.commit()
-    conn.close()
-    _invalidate_balance_cache(player_id)
-
-    return {
-        "status":       "success",
-        "item_id":      item_id,
-        "gems_granted": gems_grant,
-        "gold_granted": gold_grant,
-        "new_gems":     int(row[0]),
-        "new_balance":  int(row[1]),
-    }
 
 
 @app.post("/iap/verify")
@@ -7650,6 +7720,10 @@ async def elite_claim_milestone(request: Request):
 #  (leaderboard ranking, new-player bonus, legacy event shards). The client sends
 #  NO X-Signature on these, so they use extract_player_id only (no HMAC verify).
 # ============================================================================
+_LB_CACHE_KEY = "leaderboard:weekly:top100"
+_LB_CACHE_TTL = 60  # seconds; top-100 list is shared across all callers
+
+
 @app.get("/leaderboard/weekly")
 def compat_leaderboard_weekly(request: Request):
     """Weekly "Top Cashouts" board -- resets every Sunday 00:00 UTC.
@@ -7660,52 +7734,86 @@ def compat_leaderboard_weekly(request: Request):
     time -- no new client-visible schema. `me` reflects the caller's
     current-week standing and rank even if they are outside the top 100.
     `seconds_until_reset` in the response root drives the client countdown.
+
+    Performance: the shared top-100 list is cached in Redis for
+    _LB_CACHE_TTL seconds so concurrent opens hit the DB at most once
+    per minute instead of once per request.  Personal rank data (`me`)
+    is always fetched fresh -- it is caller-specific and cannot be shared.
     """
     player_id = extract_player_id(request)
     ws = _week_start_ts()
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    # --- Top-100 list: serve from Redis when available (cache-aside) ---
+    leaderboard = None
+    if _REDIS is not None:
+        try:
+            cached = _REDIS.get(_LB_CACHE_KEY)
+            if cached:
+                leaderboard = json.loads(cached)
+        except Exception:
+            pass  # Redis failure falls through to the DB query below
 
-    cursor.execute(
-        "SELECT player_id, "
-        "       CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
-        "       max_unlocked_tier "
-        "FROM players "
-        "ORDER BY CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END DESC "
-        "LIMIT 100",
-        (ws, ws),
-    )
-    rows = cursor.fetchall()
+    # Safe defaults so me-dict construction after finally never hits UnboundLocalError.
+    my_cashout = 0
+    my_tier    = 1
+    my_rank    = 999999
 
-    leaderboard = []
-    for idx, (pid, cashout, tier) in enumerate(rows):
-        entry_rank = idx + 1
-        leaderboard.append({
-            "rank":         entry_rank,
-            "display_name": "Player " + str(pid)[-4:].upper(),
-            "avatar_tier":  max(1, min(int(tier or 1), 7)),
-            "weekly_gold":  int(cashout or 0),
-            "reward":       _LEADERBOARD_REWARDS.get(entry_rank, {"gems": 0, "gold": 0}),
-        })
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
-        "       max_unlocked_tier "
-        "FROM players WHERE player_id = ?",
-        (ws, player_id),
-    )
-    me_row = cursor.fetchone()
-    my_cashout = int(me_row[0] or 0) if me_row else 0
-    my_tier    = int(me_row[1] or 1) if me_row else 1
+        # Cache miss: query DB and populate the cache for subsequent callers.
+        if leaderboard is None:
+            cursor.execute(
+                "SELECT player_id, "
+                "       CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+                "       max_unlocked_tier "
+                "FROM players "
+                "ORDER BY CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END DESC "
+                "LIMIT 100",
+                (ws, ws),
+            )
+            rows = cursor.fetchall()
 
-    cursor.execute(
-        "SELECT COUNT(*) + 1 FROM players "
-        "WHERE (CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END) > ?",
-        (ws, my_cashout),
-    )
-    my_rank = int(cursor.fetchone()[0])
-    conn.close()
+            leaderboard = []
+            for idx, (pid, cashout, tier) in enumerate(rows):
+                entry_rank = idx + 1
+                leaderboard.append({
+                    "rank":         entry_rank,
+                    "display_name": "Player " + str(pid)[-4:].upper(),
+                    "avatar_tier":  max(1, min(int(tier or 1), 7)),
+                    "weekly_gold":  int(cashout or 0),
+                    "reward":       _LEADERBOARD_REWARDS.get(entry_rank, {"gems": 0, "gold": 0}),
+                })
+
+            if _REDIS is not None:
+                try:
+                    _REDIS.setex(_LB_CACHE_KEY, _LB_CACHE_TTL, json.dumps(leaderboard))
+                except Exception:
+                    pass  # cache write failure must never block the response
+
+        # Personal rank (caller-specific; never cached).
+        cursor.execute(
+            "SELECT CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+            "       max_unlocked_tier "
+            "FROM players WHERE player_id = ?",
+            (ws, player_id),
+        )
+        me_row = cursor.fetchone()
+        my_cashout = int(me_row[0] or 0) if me_row else 0
+        my_tier    = int(me_row[1] or 1) if me_row else 1
+
+        cursor.execute(
+            "SELECT COUNT(*) + 1 FROM players "
+            "WHERE (CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END) > ?",
+            (ws, my_cashout),
+        )
+        my_rank = int(cursor.fetchone()[0])
+
+    finally:
+        if conn is not None:
+            conn.close()
 
     me = {
         "rank":         my_rank,
