@@ -834,6 +834,26 @@ def column_exists(cursor, table_name: str, column_name: str) -> bool:
     return column_name in [row[1] for row in cursor.fetchall()]
 
 
+def _week_start_ts() -> float:
+    """Unix timestamp of the most recent Sunday 00:00:00 UTC.
+    Used as the weekly-leaderboard reset boundary."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    days_back = (now.weekday() + 1) % 7   # Mon=0..Sun=6 → days since last Sunday
+    sunday = (now - datetime.timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return sunday.timestamp()
+
+
+def _seconds_until_reset() -> int:
+    """Seconds until the next Sunday 00:00:00 UTC."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    days_back = (now.weekday() + 1) % 7
+    last_sunday = (now - datetime.timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    next_sunday = last_sunday + datetime.timedelta(days=7)
+    return max(0, int((next_sunday - now).total_seconds()))
+
+
 def get_active_boosts(player_id: str, cursor) -> dict[str, int]:
     """Returns {boost_id: seconds_left} for every unexpired boost belonging to
     player_id, lazily deleting any rows that have expired."""
@@ -1084,6 +1104,12 @@ def init_db():
 
     if not column_exists(cursor, "players", "last_rush_date"):
         cursor.execute("ALTER TABLE players ADD COLUMN last_rush_date TEXT DEFAULT NULL")
+
+    # --- Weekly leaderboard tracking ---
+    if not column_exists(cursor, "players", "weekly_cashout"):
+        cursor.execute("ALTER TABLE players ADD COLUMN weekly_cashout INTEGER DEFAULT 0")
+    if not column_exists(cursor, "players", "weekly_reset_at"):
+        cursor.execute("ALTER TABLE players ADD COLUMN weekly_reset_at REAL DEFAULT 0")
 
     # telemetry_logs must exist before any ALTER TABLE checks against it.
     cursor.execute("""
@@ -2376,11 +2402,13 @@ async def admin_seed_test_score(request: Request):
     if secret and request.headers.get("X-Admin-Secret", "") != secret:
         raise HTTPException(status_code=403, detail="forbidden")
     try:
-        body       = await request.json()
-        target     = str(body.get("player_id", "")).strip()
-        cashout    = int(body.get("best_single_cashout", 0))
-        tier_raw   = body.get("max_unlocked_tier", None)
-        tier       = int(tier_raw) if tier_raw is not None else None
+        body             = await request.json()
+        target           = str(body.get("player_id", "")).strip()
+        cashout          = int(body.get("best_single_cashout", 0))
+        tier_raw         = body.get("max_unlocked_tier", None)
+        tier             = int(tier_raw) if tier_raw is not None else None
+        weekly_raw       = body.get("weekly_cashout", None)
+        weekly_cashout_v = int(weekly_raw) if weekly_raw is not None else cashout
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     if not target:
@@ -2391,12 +2419,15 @@ async def admin_seed_test_score(request: Request):
     get_or_create_player(target, cursor)
     cursor.execute(
         "UPDATE players SET best_single_cashout = ?, "
-        "max_unlocked_tier = COALESCE(?, max_unlocked_tier) WHERE player_id = ?",
-        (cashout, tier, target),
+        "max_unlocked_tier = COALESCE(?, max_unlocked_tier), "
+        "weekly_cashout = ?, weekly_reset_at = ? "
+        "WHERE player_id = ?",
+        (cashout, tier, weekly_cashout_v, _week_start_ts(), target),
     )
     conn.commit()
     conn.close()
-    return {"status": "ok", "player_id": target, "best_single_cashout": cashout}
+    return {"status": "ok", "player_id": target,
+            "best_single_cashout": cashout, "weekly_cashout": weekly_cashout_v}
 
 
 @app.post("/player/set_age")
@@ -4185,7 +4216,8 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
                    best_combo, cursed_tiles_removed, total_runs, total_merges,
                    high_tier_merges, best_session_merges, best_single_cashout,
                    peak_wallet_balance, total_money, board_stage,
-                   COALESCE(max_tier_reached, 0)
+                   COALESCE(max_tier_reached, 0),
+                   COALESCE(weekly_cashout, 0), COALESCE(weekly_reset_at, 0)
             FROM players
             WHERE player_id = ?
         """, (player_id,))
@@ -4212,6 +4244,14 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
         peak_wallet_balance  = max(int(row[10] or 0), new_total_money)
         board_stage_for_quest = int(row[12]) if row[12] is not None else 0
         max_tier_reached_new  = max(int(row[13] or 0), max_tier_merged_run)
+        prev_weekly_cashout  = int(row[14] or 0)
+        prev_weekly_reset_at = float(row[15] or 0.0)
+        _ws = _week_start_ts()
+        # Lazy weekly reset: if the stored reset marker predates this week's
+        # Sunday boundary, discard the old score and start fresh.
+        new_weekly_cashout  = (best_cashout_run if prev_weekly_reset_at < _ws
+                               else prev_weekly_cashout + best_cashout_run)
+        new_weekly_reset_at = _ws
 
         cursor.execute("""
             UPDATE players
@@ -4227,6 +4267,8 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
                 best_single_cashout = ?,
                 peak_wallet_balance = ?,
                 max_tier_reached = ?,
+                weekly_cashout = ?,
+                weekly_reset_at = ?,
                 is_rescue_active = 0
             WHERE player_id = ?
         """, (
@@ -4242,6 +4284,8 @@ async def submit_run_stats(request: Request, payload: Dict[str, Any] = Body(...)
             best_single_cashout,
             peak_wallet_balance,
             max_tier_reached_new,
+            new_weekly_cashout,
+            new_weekly_reset_at,
             player_id
         ))
 
@@ -7564,21 +7608,29 @@ async def elite_claim_milestone(request: Request):
 # ============================================================================
 @app.get("/leaderboard/weekly")
 def compat_leaderboard_weekly(request: Request):
-    """All-time "Top Cashouts" board, ranked by best_single_cashout.
+    """Weekly "Top Cashouts" board -- resets every Sunday 00:00 UTC.
 
-    No weekly-reset infrastructure exists yet, so this serves the all-time
-    standings under the existing "weekly" route/shape the client expects.
-    display_name/avatar_tier/weekly_gold are derived at query time -- no
-    new columns. `me` always reflects the caller's standing, even if they
-    are outside the top 100.
+    Scores accumulate across all runs in the current week (lazy reset:
+    weekly_cashout is discarded on read if weekly_reset_at predates this
+    week's Sunday boundary). display_name/avatar_tier derived at query
+    time -- no new client-visible schema. `me` reflects the caller's
+    current-week standing and rank even if they are outside the top 100.
+    `seconds_until_reset` in the response root drives the client countdown.
     """
     player_id = extract_player_id(request)
+    ws = _week_start_ts()
+
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT player_id, best_single_cashout, max_unlocked_tier "
-        "FROM players ORDER BY best_single_cashout DESC LIMIT 100"
+        "SELECT player_id, "
+        "       CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+        "       max_unlocked_tier "
+        "FROM players "
+        "ORDER BY CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END DESC "
+        "LIMIT 100",
+        (ws, ws),
     )
     rows = cursor.fetchall()
 
@@ -7592,16 +7644,19 @@ def compat_leaderboard_weekly(request: Request):
         })
 
     cursor.execute(
-        "SELECT best_single_cashout, max_unlocked_tier FROM players WHERE player_id = ?",
-        (player_id,),
+        "SELECT CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+        "       max_unlocked_tier "
+        "FROM players WHERE player_id = ?",
+        (ws, player_id),
     )
     me_row = cursor.fetchone()
     my_cashout = int(me_row[0] or 0) if me_row else 0
-    my_tier = int(me_row[1] or 1) if me_row else 1
+    my_tier    = int(me_row[1] or 1) if me_row else 1
 
     cursor.execute(
-        "SELECT COUNT(*) + 1 FROM players WHERE best_single_cashout > ?",
-        (my_cashout,),
+        "SELECT COUNT(*) + 1 FROM players "
+        "WHERE (CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END) > ?",
+        (ws, my_cashout),
     )
     my_rank = int(cursor.fetchone()[0])
     conn.close()
@@ -7612,7 +7667,12 @@ def compat_leaderboard_weekly(request: Request):
         "avatar_tier": max(1, min(my_tier, 7)),
         "weekly_gold": my_cashout,
     }
-    return {"status": "ok", "leaderboard": leaderboard, "me": me}
+    return {
+        "status": "ok",
+        "leaderboard": leaderboard,
+        "me": me,
+        "seconds_until_reset": _seconds_until_reset(),
+    }
 
 
 @app.post("/leaderboard/claim")
