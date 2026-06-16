@@ -131,6 +131,16 @@ class _MaxBodySizeMiddleware(BaseHTTPMiddleware):
 app.add_middleware(_MaxBodySizeMiddleware)
 
 # ---------------------------------------------------------------------------
+# Weekly leaderboard reward matrix -- synced between backend claim logic and
+# the client prize-preview labels.  Only ranks 1-3 receive payouts.
+# ---------------------------------------------------------------------------
+_LEADERBOARD_REWARDS: dict = {
+    1: {"gems": 250, "gold": 10_000},
+    2: {"gems": 100, "gold":  5_000},
+    3: {"gems":  50, "gold":  2_500},
+}
+
+# ---------------------------------------------------------------------------
 # Database configuration
 # Set DATABASE_URL for PostgreSQL (e.g. "postgresql://user:pass@host/db").
 # Leave unset (or set to empty string) to use the local SQLite dev setup.
@@ -1110,6 +1120,8 @@ def init_db():
         cursor.execute("ALTER TABLE players ADD COLUMN weekly_cashout INTEGER DEFAULT 0")
     if not column_exists(cursor, "players", "weekly_reset_at"):
         cursor.execute("ALTER TABLE players ADD COLUMN weekly_reset_at REAL DEFAULT 0")
+    if not column_exists(cursor, "players", "weekly_reward_claimed_at"):
+        cursor.execute("ALTER TABLE players ADD COLUMN weekly_reward_claimed_at REAL DEFAULT 0")
 
     # telemetry_logs must exist before any ALTER TABLE checks against it.
     cursor.execute("""
@@ -2404,11 +2416,15 @@ async def admin_seed_test_score(request: Request):
     try:
         body             = await request.json()
         target           = str(body.get("player_id", "")).strip()
-        cashout          = int(body.get("best_single_cashout", 0))
+        use_random       = bool(body.get("random_score", False))
+        cashout_raw      = body.get("best_single_cashout", 0)
+        cashout          = (random.randint(15_000, 85_000) if use_random
+                           else int(cashout_raw))
         tier_raw         = body.get("max_unlocked_tier", None)
         tier             = int(tier_raw) if tier_raw is not None else None
         weekly_raw       = body.get("weekly_cashout", None)
-        weekly_cashout_v = int(weekly_raw) if weekly_raw is not None else cashout
+        weekly_cashout_v = (cashout if use_random
+                           else (int(weekly_raw) if weekly_raw is not None else cashout))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     if not target:
@@ -3455,6 +3471,34 @@ def get_balance(request: Request):
         "xp_to_next_level":       _bal_xp_bar["xp_to_next_level"],
         "total_runs":             int(row[35]) if row[35] is not None else 0,
     }
+
+    # --- Leaderboard reward eligibility --------------------------------------
+    # Cheap: one read + one COUNT on the weekly column, only when the player
+    # has a non-zero weekly score that hasn't been claimed yet this week.
+    _lb_reward_available = False
+    try:
+        _ws_lb = _week_start_ts()
+        cursor.execute(
+            "SELECT CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+            "       COALESCE(weekly_reward_claimed_at, 0) "
+            "FROM players WHERE player_id = ?",
+            (_ws_lb, player_id),
+        )
+        _lb_r = cursor.fetchone()
+        if _lb_r:
+            _lb_score    = int(_lb_r[0] or 0)
+            _lb_claimed  = float(_lb_r[1] or 0.0)
+            if _lb_score > 0 and _lb_claimed < _ws_lb:
+                cursor.execute(
+                    "SELECT COUNT(*) + 1 FROM players "
+                    "WHERE (CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END) > ?",
+                    (_ws_lb, _lb_score),
+                )
+                _lb_rank = int(cursor.fetchone()[0])
+                _lb_reward_available = _lb_rank in _LEADERBOARD_REWARDS
+    except Exception:
+        pass  # Never let a leaderboard sub-query break the main balance response
+    _bal_result["leaderboard_reward_available"] = _lb_reward_available
 
     # --- Redis cache write ---------------------------------------------------
     # Skip caching when one-time grant events fired this call (vault drip,
@@ -7636,11 +7680,13 @@ def compat_leaderboard_weekly(request: Request):
 
     leaderboard = []
     for idx, (pid, cashout, tier) in enumerate(rows):
+        entry_rank = idx + 1
         leaderboard.append({
-            "rank": idx + 1,
+            "rank":         entry_rank,
             "display_name": "Player " + str(pid)[-4:].upper(),
-            "avatar_tier": max(1, min(int(tier or 1), 7)),
-            "weekly_gold": int(cashout or 0),
+            "avatar_tier":  max(1, min(int(tier or 1), 7)),
+            "weekly_gold":  int(cashout or 0),
+            "reward":       _LEADERBOARD_REWARDS.get(entry_rank, {"gems": 0, "gold": 0}),
         })
 
     cursor.execute(
@@ -7662,10 +7708,11 @@ def compat_leaderboard_weekly(request: Request):
     conn.close()
 
     me = {
-        "rank": my_rank,
+        "rank":         my_rank,
         "display_name": "Player " + str(player_id)[-4:].upper(),
-        "avatar_tier": max(1, min(my_tier, 7)),
-        "weekly_gold": my_cashout,
+        "avatar_tier":  max(1, min(my_tier, 7)),
+        "weekly_gold":  my_cashout,
+        "reward":       _LEADERBOARD_REWARDS.get(my_rank, {"gems": 0, "gold": 0}),
     }
     return {
         "status": "ok",
@@ -7676,9 +7723,51 @@ def compat_leaderboard_weekly(request: Request):
 
 
 @app.post("/leaderboard/claim")
-async def compat_leaderboard_claim(request: Request):
-    extract_player_id(request)
-    return {"status": "ok", "gems_awarded": 0}
+def leaderboard_claim_reward(request: Request):
+    """Award this week's rank reward (gems + gold) and mark it claimed.
+    Idempotent: repeated calls within the same week return (0, 0)."""
+    player_id = extract_player_id(request)
+    ws = _week_start_ts()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END, "
+        "       COALESCE(weekly_reward_claimed_at, 0), gems_balance, total_money "
+        "FROM players WHERE player_id = ?",
+        (ws, player_id),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return {"status": "ok", "gems_awarded": 0, "gold_awarded": 0}
+
+    weekly_score = int(row[0] or 0)
+    claimed_at   = float(row[1] or 0.0)
+
+    if weekly_score <= 0 or claimed_at >= ws:
+        conn.close()
+        return {"status": "ok", "gems_awarded": 0, "gold_awarded": 0}
+
+    cursor.execute(
+        "SELECT COUNT(*) + 1 FROM players "
+        "WHERE (CASE WHEN weekly_reset_at >= ? THEN weekly_cashout ELSE 0 END) > ?",
+        (ws, weekly_score),
+    )
+    rank   = int(cursor.fetchone()[0])
+    reward = _LEADERBOARD_REWARDS.get(rank, {"gems": 0, "gold": 0})
+
+    cursor.execute(
+        "UPDATE players SET gems_balance  = gems_balance + ?, "
+        "                   total_money   = total_money  + ?, "
+        "                   weekly_reward_claimed_at = ? "
+        "WHERE player_id = ?",
+        (reward["gems"], reward["gold"], ws, player_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "gems_awarded": reward["gems"],
+            "gold_awarded": reward["gold"], "rank": rank}
 
 
 @app.get("/leaderboard/rival")
