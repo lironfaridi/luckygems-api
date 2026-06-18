@@ -541,6 +541,8 @@ IDLE_PIGGY_MAX_HOURS     = 72         # hard ceiling: 3 days of offline earnings
 # first-session achievement farming.
 # ---------------------------------------------------------------------------
 DAILY_FREE_GEM_CAP       = 15         # max free gems earnable per calendar day (IAP value protection)
+AD_DAILY_CAP             = 5          # hard server cap: max rewarded ad claims per UTC calendar day
+AD_CLAIM_GEMS            = 25         # gems credited per successful /ads/claim_reward call
 
 # Vault Pass tier thresholds (cumulative shards required to reach each tier).
 # Tier 0 = 0 shards (everyone starts here).  Tier 4 = max tier.
@@ -1468,6 +1470,16 @@ def init_db():
 
     for lvl, cfg in MARKET_CONFIG.items():
         cursor.execute(_SQL_INSERT_MARKET_PRICE, (lvl, cfg["base"]))
+
+    # --- P7: server-side daily rewarded-ad counter ---
+    if not column_exists(cursor, "players", "ad_claims_date"):
+        cursor.execute(
+            "ALTER TABLE players ADD COLUMN ad_claims_date TEXT DEFAULT NULL"
+        )
+    if not column_exists(cursor, "players", "ad_claims_count"):
+        cursor.execute(
+            "ALTER TABLE players ADD COLUMN ad_claims_count INTEGER DEFAULT 0"
+        )
 
     conn.commit()
     conn.close()
@@ -3975,26 +3987,51 @@ ACHIEVEMENT_CONFIG = {
 
 # ---------------------------------------------------------------------------
 # Daily quest system -- server-seeded deterministic selection
-# 15-item pool; SHA256(player_id + ':' + UTC date) picks 3 each day.
+# 37-item pool; SHA256(player_id + ':' + UTC date) picks 3 each day.
 # No DB writes for selection -- claims are the only persistent event.
 # ---------------------------------------------------------------------------
 _DAILY_QUEST_POOL: List[Dict[str, Any]] = [
-    # id                 title                   desc                                           type               target  gold  gems
-    {"id": "daily_cashout",   "title": "Cashout Artist",  "desc": "Cashout 2 times.",                   "type": "cashouts",        "target": 2,    "gold": 400,  "gems": 3},
-    {"id": "daily_cursed",    "title": "Curse Breaker",   "desc": "Remove 3 cursed tiles.",             "type": "cursed_removed",  "target": 3,    "gold": 300,  "gems": 3},
-    {"id": "daily_runs",      "title": "Keep Rolling",    "desc": "Complete 2 runs.",                   "type": "run_count",       "target": 2,    "gold": 350,  "gems": 3},
-    {"id": "daily_combo",     "title": "Combo Chaser",    "desc": "Hit a 3x combo.",                    "type": "best_combo",      "target": 3,    "gold": 400,  "gems": 3},
-    {"id": "daily_survival",  "title": "Endurance Test",  "desc": "Survive 60 seconds in a run.",       "type": "survival_time",   "target": 60,   "gold": 350,  "gems": 3},
-    {"id": "daily_merges",    "title": "Merge Machine",   "desc": "Merge 30 times.",                    "type": "run_merges",      "target": 30,   "gold": 400,  "gems": 3},
-    {"id": "daily_highscore", "title": "Big Earner",      "desc": "Earn $2,000 in a single run.",       "type": "cash_earned",     "target": 2000, "gold": 500,  "gems": 2},
-    {"id": "daily_merges2",   "title": "Merge Overdrive", "desc": "Merge 60 times.",                    "type": "run_merges",      "target": 60,   "gold": 600,  "gems": 2},
-    {"id": "daily_cashout2",  "title": "Five-Star Run",   "desc": "Cashout 5 times.",                   "type": "cashouts",        "target": 5,    "gold": 600,  "gems": 3},
-    {"id": "daily_survival2", "title": "Marathon Mode",   "desc": "Survive 120 seconds in a run.",      "type": "survival_time",   "target": 120,  "gold": 700,  "gems": 3},
-    {"id": "daily_combo2",    "title": "Combo King",      "desc": "Hit a 5x combo.",                    "type": "best_combo",      "target": 5,    "gold": 750,  "gems": 4},
-    {"id": "daily_runs3",     "title": "Grind Day",       "desc": "Complete 4 runs.",                   "type": "run_count",       "target": 4,    "gold": 600,  "gems": 5},
-    {"id": "daily_tools",     "title": "Tool Master",     "desc": "Use 3 tools in a single run.",       "type": "tools_used",      "target": 3,    "gold": 500,  "gems": 4},
-    {"id": "daily_tier5",     "title": "Gem Seeker",      "desc": "Unlock a tier-5 gem in a run.",      "type": "max_tier_seen",   "target": 5,    "gold": 600,  "gems": 4},
-    {"id": "daily_golden",    "title": "Golden Touch",    "desc": "Cashout with a Golden Tile active.", "type": "golden_cashouts", "target": 1,    "gold": 800,  "gems": 5},
+    # --- WARM-UP (easy, low rewards) ---
+    {"id": "daily_cashout",        "title": "Cashout Artist",  "desc": "Cashout 2 times.",                           "type": "cashouts",            "target": 2,     "gold": 400,  "gems": 3},
+    {"id": "daily_cursed",         "title": "Curse Breaker",   "desc": "Remove 3 cursed tiles.",                     "type": "cursed_removed",      "target": 3,     "gold": 300,  "gems": 3},
+    {"id": "daily_runs",           "title": "Keep Rolling",    "desc": "Complete 2 runs.",                           "type": "run_count",           "target": 2,     "gold": 350,  "gems": 3},
+    {"id": "daily_combo",          "title": "Combo Chaser",    "desc": "Hit a 3x combo.",                            "type": "best_combo",          "target": 3,     "gold": 400,  "gems": 3},
+    {"id": "daily_survival",       "title": "Endurance Test",  "desc": "Survive 60 seconds in a run.",               "type": "survival_time",       "target": 60,    "gold": 350,  "gems": 3},
+    {"id": "daily_merges",         "title": "Merge Machine",   "desc": "Merge 30 times in a single run.",            "type": "run_merges",          "target": 30,    "gold": 400,  "gems": 3},
+    {"id": "daily_combo4",         "title": "Hot Streak",      "desc": "Hit a 4x combo.",                            "type": "best_combo",          "target": 4,     "gold": 550,  "gems": 3},
+    {"id": "daily_merges_mid",     "title": "Merge Sprint",    "desc": "Merge 45 times in a single run.",            "type": "run_merges",          "target": 45,    "gold": 500,  "gems": 3},
+    # --- STANDARD (medium difficulty, mid rewards) ---
+    {"id": "daily_highscore",      "title": "Big Earner",      "desc": "Earn $2,000 in a single run.",               "type": "cash_earned",         "target": 2000,  "gold": 500,  "gems": 2},
+    {"id": "daily_merges2",        "title": "Merge Overdrive", "desc": "Merge 60 times in a single run.",            "type": "run_merges",          "target": 60,    "gold": 600,  "gems": 2},
+    {"id": "daily_cashout2",       "title": "Five-Star Run",   "desc": "Cashout 5 times.",                           "type": "cashouts",            "target": 5,     "gold": 600,  "gems": 3},
+    {"id": "daily_survival2",      "title": "Marathon Mode",   "desc": "Survive 120 seconds in a run.",              "type": "survival_time",       "target": 120,   "gold": 700,  "gems": 3},
+    {"id": "daily_tools",          "title": "Tool Master",     "desc": "Use 3 tools in a single run.",               "type": "tools_used",          "target": 3,     "gold": 500,  "gems": 4},
+    {"id": "daily_tier5",          "title": "Gem Seeker",      "desc": "Unlock a tier-5 gem in a run.",              "type": "max_tier_seen",       "target": 5,     "gold": 600,  "gems": 4},
+    {"id": "daily_singlecashout",  "title": "One Big Hit",     "desc": "Earn $1,000 in a single cashout.",           "type": "best_single_cashout", "target": 1000,  "gold": 500,  "gems": 3},
+    {"id": "daily_hammer",         "title": "Hammer Time",     "desc": "Use the Hammer tool 2 times.",               "type": "hammer_used",         "target": 2,     "gold": 400,  "gems": 3},
+    {"id": "daily_reroll",         "title": "Roll Again",      "desc": "Use the Reroll tool 3 times.",               "type": "reroll_used",         "target": 3,     "gold": 450,  "gems": 3},
+    {"id": "daily_crystal",        "title": "Crystal Buyer",   "desc": "Buy a crystal 2 times.",                     "type": "crystals_bought",     "target": 2,     "gold": 500,  "gems": 3},
+    {"id": "daily_tier3_merges",   "title": "Tier Climber",    "desc": "Merge 5 tier-3 gems in a run.",              "type": "tier3_merges",        "target": 5,     "gold": 450,  "gems": 3},
+    {"id": "daily_bigcash",        "title": "Big Score",       "desc": "Earn $5,000 in a single run.",               "type": "cash_earned",         "target": 5000,  "gold": 700,  "gems": 4},
+    # --- HARD (high difficulty, premium rewards) ---
+    {"id": "daily_combo2",         "title": "Combo King",      "desc": "Hit a 5x combo.",                            "type": "best_combo",          "target": 5,     "gold": 750,  "gems": 4},
+    {"id": "daily_runs3",          "title": "Grind Day",       "desc": "Complete 4 runs.",                           "type": "run_count",           "target": 4,     "gold": 600,  "gems": 5},
+    {"id": "daily_golden",         "title": "Golden Touch",    "desc": "Cashout with a Golden Tile active.",         "type": "golden_cashouts",     "target": 1,     "gold": 800,  "gems": 5},
+    {"id": "daily_tools2",         "title": "Power Player",    "desc": "Use 5 tools in a single run.",               "type": "tools_used",          "target": 5,     "gold": 700,  "gems": 4},
+    {"id": "daily_tier4_merges",   "title": "High Stakes",     "desc": "Merge 3 tier-4 gems in a run.",              "type": "tier4_merges",        "target": 3,     "gold": 550,  "gems": 4},
+    {"id": "daily_hammer2",        "title": "Demolition Day",  "desc": "Use the Hammer tool 5 times.",               "type": "hammer_used",         "target": 5,     "gold": 650,  "gems": 4},
+    {"id": "daily_singlecashout2", "title": "Triple Payday",   "desc": "Earn $3,000 in a single cashout.",           "type": "best_single_cashout", "target": 3000,  "gold": 750,  "gems": 4},
+    {"id": "daily_cashout3",       "title": "Cashout Streak",  "desc": "Cashout 8 times.",                           "type": "cashouts",            "target": 8,     "gold": 750,  "gems": 4},
+    {"id": "daily_survival3",      "title": "Iron Endurance",  "desc": "Survive 180 seconds in a run.",              "type": "survival_time",       "target": 180,   "gold": 900,  "gems": 5},
+    {"id": "daily_combo3",         "title": "Combo Legend",    "desc": "Hit a 7x combo.",                            "type": "best_combo",          "target": 7,     "gold": 900,  "gems": 5},
+    {"id": "daily_megacash",       "title": "Vault Overflow",  "desc": "Earn $10,000 in a single run.",              "type": "cash_earned",         "target": 10000, "gold": 900,  "gems": 5},
+    {"id": "daily_tier5_merges",   "title": "Elite Fusion",    "desc": "Merge 2 tier-5 gems in a run.",              "type": "tier5_merges",        "target": 2,     "gold": 700,  "gems": 5},
+    {"id": "daily_runs4",          "title": "Full Grind",      "desc": "Complete 6 runs.",                           "type": "run_count",           "target": 6,     "gold": 700,  "gems": 5},
+    # --- ELITE (low probability, high rewards) ---
+    {"id": "daily_tier6_reach",    "title": "Crown Jewel",     "desc": "Unlock a tier-6 gem in a run.",              "type": "max_tier_seen",       "target": 6,     "gold": 1000, "gems": 6},
+    {"id": "daily_golden2",        "title": "Double Gold",     "desc": "Cashout with a Golden Tile active 2 times.", "type": "golden_cashouts",     "target": 2,     "gold": 1000, "gems": 5},
+    {"id": "daily_survival4",      "title": "Unstoppable",     "desc": "Survive 240 seconds in a run.",              "type": "survival_time",       "target": 240,   "gold": 1100, "gems": 6},
+    {"id": "daily_tier7_reach",    "title": "Legendary Gem",   "desc": "Unlock a tier-7 gem in a run.",              "type": "max_tier_seen",       "target": 7,     "gold": 1200, "gems": 7},
 ]
 _DAILY_QUEST_MAP: Dict[str, Dict] = {q["id"]: q for q in _DAILY_QUEST_POOL}
 
@@ -4015,21 +4052,10 @@ def _daily_quest_ids_for(player_id: str, date_str: str) -> list:
     return pool_ids[:3]
 
 
-# Server-authoritative purple gem amounts per quest_id.
-# Must stay in sync with DAILY_POOL in rewards_center.gd.
+# Server-authoritative gem amounts per quest_id (derived from pool; kept for
+# legacy compatibility with rewards_center.gd which reads this dict directly).
 DAILY_QUEST_GEM_REWARDS: Dict[str, int] = {
-    "daily_cashout":   0,
-    "daily_cursed":    0,
-    "daily_runs":      0,
-    "daily_combo":     0,
-    "daily_survival":  0,
-    "daily_merges":    0,
-    "daily_highscore": 2,
-    "daily_merges2":   2,
-    "daily_cashout2":  3,
-    "daily_survival2": 3,
-    "daily_combo2":    4,
-    "daily_runs3":     5,
+    q["id"]: q["gems"] for q in _DAILY_QUEST_POOL
 }
 
 # Stat column + tier targets used to validate AND auto-unlock achievements.
@@ -6221,6 +6247,109 @@ async def ad_reward_token(request: Request):
 
     token = _issue_ad_token(player_id, context)
     return {"status": "success", "ad_reward_token": token, "context": context}
+
+
+@app.post("/ads/claim_reward")
+async def ads_claim_reward(request: Request):
+    """
+    Server-validated daily rewarded-ad quest tracker.
+
+    Increments an atomic Redis counter keyed ad_clicks:{player_id}:{YYYY-MM-DD} (UTC).
+    Hard cap: AD_DAILY_CAP (5) claims per calendar day.
+    On success: credits AD_CLAIM_GEMS (25) gems and returns the authoritative count.
+    Falls back to DB columns (ad_claims_date / ad_claims_count) when Redis is unavailable.
+
+    HTTP 429 is returned when the daily cap is exceeded.
+    """
+    player_id = extract_player_id(request)
+
+    if not _check_rate_limit(player_id, "ads_claim_reward", min_interval_secs=15.0):
+        return {"status": "error", "message": "Request too fast -- please wait."}
+
+    today_utc = datetime.datetime.utcnow().date().isoformat()
+
+    # --- Atomic increment via Redis (primary path) ---
+    count: int = 0
+    used_redis: bool = False
+    if _REDIS is not None:
+        try:
+            redis_key = f"ad_clicks:{player_id}:{today_utc}"
+            count = int(_REDIS.incr(redis_key))
+            if count == 1:
+                # First claim today: set TTL so the key self-cleans after 48 h.
+                _REDIS.expire(redis_key, 172800)
+            used_redis = True
+        except Exception as _re:
+            logging.warning(f"ads_claim_reward: Redis error ({_re}) -- falling back to DB")
+            used_redis = False
+
+    if used_redis and count > AD_DAILY_CAP:
+        # Roll back the over-limit increment to keep the counter accurate.
+        try:
+            _REDIS.decr(f"ad_clicks:{player_id}:{today_utc}")
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "daily_limit_reached",
+                    "message": "Maximum 5 rewarded ads per day reached"},
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        get_or_create_player(player_id, cursor)
+
+        if not used_redis:
+            # DB fallback: read-then-write (SQLite single-writer is safe; PG dev acceptable).
+            cursor.execute(
+                "SELECT ad_claims_date, ad_claims_count FROM players WHERE player_id = ?",
+                (player_id,),
+            )
+            row = cursor.fetchone()
+            if row and str(row[0]) == today_utc:
+                count = int(row[1]) + 1
+            else:
+                count = 1
+            if count > AD_DAILY_CAP:
+                raise HTTPException(
+                    status_code=429,
+                    detail={"error": "daily_limit_reached",
+                            "message": "Maximum 5 rewarded ads per day reached"},
+                )
+
+        # Keep DB columns in sync (best-effort; non-transactionally critical when Redis is primary).
+        cursor.execute(
+            "UPDATE players SET ad_claims_date = ?, ad_claims_count = ? WHERE player_id = ?",
+            (today_utc, count, player_id),
+        )
+
+        gems_credited = _award_free_gems(cursor, player_id, AD_CLAIM_GEMS, today_utc)
+
+        cursor.execute(
+            "SELECT gems_balance FROM players WHERE player_id = ?", (player_id,)
+        )
+        gems_row = cursor.fetchone()
+        gems_balance = int(gems_row[0]) if gems_row else 0
+        _invalidate_balance_cache(player_id)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as _exc:
+        conn.rollback()
+        logging.error(f"ads_claim_reward error for {player_id}: {_exc}")
+        return {"status": "error", "message": "Internal error -- please try again."}
+    finally:
+        conn.close()
+
+    return {
+        "status":        "success",
+        "gems_credited": gems_credited,
+        "gems_balance":  gems_balance,
+        "count":         count,
+        "remaining":     max(0, AD_DAILY_CAP - count),
+    }
 
 
 @app.post("/player/double_daily")
