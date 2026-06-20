@@ -285,6 +285,11 @@ if REDIS_URL:
         print(f"[cache] WARN: Redis unreachable ({_redis_err}) — caching disabled")
         _REDIS = None
 
+if not _USE_POSTGRES:
+    print("[db] *** CRITICAL WARNING: Running with ephemeral SQLite (economy.db). ***")
+    print("[db] *** ALL PLAYER DATA WILL BE WIPED ON EVERY SERVER RESTART.        ***")
+    print("[db] *** Set DATABASE_URL=postgresql://... on Render for persistence.   ***")
+
 
 def _invalidate_balance_cache(player_id: str) -> None:
     """Drop the Redis balance cache entry for a player after any financial write."""
